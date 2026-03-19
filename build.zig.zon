@@ -1,0 +1,8 @@
+.{
+    .name = .ztype,
+    .version = "0.3.0",
+    .fingerprint = 0xd8da87465247969b,
+    .fingerprint = 0xd8da87465247969b,
+    .paths = .{ "" },
+    .dependencies = .{},
+}

@@ -1,0 +1,33 @@
+---
+title:    Ztype 你好世界
+author:   开发者
+date:     2025-03-19
+lang:     zh
+---
+
+@{
+  let version = "0.3.0"
+}
+
+= 简介
+
+欢迎使用 *Ztype* 排版系统！这是一个简洁、优雅的标记语言。
+
+当前版本：@(version)
+
+== 特性
+
+- 书写优先，编程有度
+- 元数据、标题、段落、语义块
+- 变量与脚本能力 @{ } 与 @()
+- 输出 HTML、调试格式
+
+== 代码示例
+
+:: code zig
+   caption: 清单1：Hello Ztype
+   ---
+   const std = @import("std");
+   pub fn main() void {
+       std.debug.print("Hello, Ztype!\n", .{});
+   }

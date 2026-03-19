@@ -1,0 +1,10 @@
+---
+title: 基础测试
+---
+= 标题
+
+段落文字。
+
+:: code zig
+   ---
+   pub fn main() void {}
