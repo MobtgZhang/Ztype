@@ -2,6 +2,7 @@
 //! 支持纸张尺寸、页边距、页眉、页脚
 
 const std = @import("std");
+const ast = @import("../ast.zig");
 
 /// 纸张规格（ISO + 常用）
 pub const PaperSize = enum {
@@ -89,11 +90,9 @@ pub const PageLayout = struct {
     footer_right: ?[]const u8 = null,
 
     /// 从文档元数据构建布局
-    pub fn fromMetadata(meta: ?*const std.StringHashMap([]const u8)) PageLayout {
+    pub fn fromDoc(doc: *const ast.Document) PageLayout {
         var layout: PageLayout = .{};
-        if (meta == null) return layout;
-
-        const m = meta.?;
+        const m = doc.metadata orelse return layout;
         if (m.get("paper")) |p| {
             const d = parsePaper(p).dimensions();
             layout.paper_w = d.w;
@@ -118,16 +117,4 @@ pub const PageLayout = struct {
         if (m.get("footer_right")) |s| layout.footer_right = s;
         return layout;
     }
-
-    /// 用 meta.get 适配
-    pub fn fromDocMeta(meta: ?*const anytype) PageLayout {
-        if (meta) |*m| {
-            return fromMetadata(&m.pairs);
-        }
-        return .{};
-    }
 };
-
-fn metadataGet(meta: anytype, key: []const u8) ?[]const u8 {
-    return meta.get(key);
-}

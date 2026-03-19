@@ -5,6 +5,7 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
 const cjk = @import("../util/cjk.zig");
+const layout = @import("../util/layout.zig");
 
 fn escapeRtfWithAlloc(allocator: std.mem.Allocator, writer: anytype, s: []const u8) !void {
     const encoded = cjk.utf8ToRtf(allocator, s) catch {
@@ -75,6 +76,17 @@ pub fn render(
     writer: anytype,
 ) !void {
     try writer.writeAll("{\\rtf1\\ansi\\uc1\\deff0\n");
+
+    const pg = layout.PageLayout.fromDoc(doc);
+    const twips_per_pt: i32 = 20;
+    try writer.print("\\paperw{d}\\paperh{d}\\margl{d}\\margr{d}\\margt{d}\\margb{d}\n", .{
+        @as(i32, @intFromFloat(pg.paper_w * twips_per_pt)),
+        @as(i32, @intFromFloat(pg.paper_h * twips_per_pt)),
+        @as(i32, @intFromFloat(pg.margin_left * twips_per_pt)),
+        @as(i32, @intFromFloat(pg.margin_right * twips_per_pt)),
+        @as(i32, @intFromFloat(pg.margin_top * twips_per_pt)),
+        @as(i32, @intFromFloat(pg.margin_bottom * twips_per_pt)),
+    });
 
     const title = if (doc.metadata) |*m| m.get("title") orelse "Untitled" else "Untitled";
     try writer.writeAll("{\\info{\\title ");

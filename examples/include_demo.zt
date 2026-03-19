@@ -1,0 +1,15 @@
+---
+title: Include 演示
+author: Ztype
+---
+= 主文档
+
+%% include lib/header.zt
+
+这是主文档内容。
+
+%% include hello.zt
+
+== 结尾
+
+以上通过 %% include 引入了 hello.zt 的内容。

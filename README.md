@@ -32,6 +32,19 @@ zig build
 zig build test
 ```
 
+## 包管理器
+
+```bash
+# 初始化项目，创建 zt.toml
+ztype init
+
+# 在文档中使用 %% include 引入其他 .zt 文件
+# %% include lib/header.zt
+# %% include chapters/ch2.zt
+```
+
+详见 [docs/package-manager.md](docs/package-manager.md)。
+
 ## 命令行选项
 
 | 选项 | 说明 |

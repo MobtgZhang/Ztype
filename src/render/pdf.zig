@@ -4,6 +4,7 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
 const cjk = @import("../util/cjk.zig");
+const layout = @import("../util/layout.zig");
 
 fn hasNonAscii(s: []const u8) bool {
     for (s) |c| {
@@ -69,12 +70,30 @@ pub fn render(
 
     try pdf.appendSlice("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n\n");
 
+    const pg = layout.PageLayout.fromDoc(doc);
     var content = std.array_list.Managed(u8).init(allocator);
     defer content.deinit();
 
-    var y: f64 = 750;
+    var y: f64 = pg.paper_h - pg.margin_top - 20;
     const line_height: f64 = 14;
-    const margin: f64 = 72;
+    const margin: f64 = pg.margin_left;
+
+    // 页眉
+    if (pg.header_left != null or pg.header_center != null or pg.header_right != null) {
+        const header_y = pg.paper_h - pg.margin_top + 5;
+        try content.appendSlice("BT\n/F1 10 Tf\n");
+        if (pg.header_left) |s| {
+            try content.writer().print("{d} {d} Td\n", .{ pg.margin_left, header_y });
+            try writePdfString(&content, allocator, s);
+            try content.appendSlice(" Tj\n");
+        }
+        if (pg.header_right) |s| {
+            try content.writer().print("{d} {d} Td\n", .{ pg.paper_w - pg.margin_right - 100, header_y });
+            try writePdfString(&content, allocator, s);
+            try content.appendSlice(" Tj\n");
+        }
+        try content.appendSlice("ET\n");
+    }
 
     for (doc.content.items) |node| {
         switch (node) {
@@ -166,7 +185,7 @@ pub fn render(
     try pdf.appendSlice("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\n");
 
     const obj3 = pdf.items.len;
-    try pdf.appendSlice("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n\n");
+    try pdf.writer().print("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {d} {d}] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n\n", .{ pg.paper_w, pg.paper_h });
 
     const obj4 = pdf.items.len;
     try pdf.appendSlice("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n\n");

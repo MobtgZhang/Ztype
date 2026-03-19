@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const ast = @import("../ast.zig");
+const layout = @import("../util/layout.zig");
 
 pub fn render(
     allocator: std.mem.Allocator,
@@ -12,13 +13,20 @@ pub fn render(
 ) !void {
     const title = if (doc.metadata) |*m| m.get("title") orelse "Untitled" else "Untitled";
     const lang = if (doc.metadata) |*m| m.get("lang") orelse "zh" else "zh";
+    const pg = layout.PageLayout.fromDoc(doc);
 
     try writer.writeAll("<!DOCTYPE html>\n<html lang=\"");
     try escapeHtml(writer, lang);
     try writer.writeAll("\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>");
     try escapeHtml(writer, title);
     try writer.writeAll("</title>\n<style>\n");
-    try writer.writeAll("body{font-family:\"Noto Sans CJK SC\",\"Noto Sans CJK JP\",\"Noto Sans CJK KR\",\"Microsoft YaHei\",\"SimSun\",sans-serif;line-height:1.6}\n");
+    try writer.writeAll("@page{size:");
+    try writer.print("{d}pt {d}pt", .{ pg.paper_w, pg.paper_h });
+    try writer.writeAll(";margin:");
+    try writer.print("{d}pt {d}pt {d}pt {d}pt", .{ pg.margin_top, pg.margin_right, pg.margin_bottom, pg.margin_left });
+    try writer.writeAll("}\n");
+    try writer.writeAll("@media print{body{max-width:100%}.page-header,.page-footer{position:fixed;left:0;right:0;font-size:10pt;color:#666;padding:8px}.page-header{top:0}.page-footer{bottom:0;top:auto}}\n");
+    try writer.writeAll("body{font-family:\"Noto Sans CJK SC\",\"Noto Sans CJK JP\",\"Noto Sans CJK KR\",\"Microsoft YaHei\",\"SimSun\",sans-serif;line-height:1.6;max-width:800px;margin:0 auto;padding:2em}\n");
     try writer.writeAll("table{border-collapse:collapse;width:100%;margin:1em 0}\n");
     try writer.writeAll("th,td{border:1px solid #ccc;padding:.5em 1em;text-align:left}\n");
     try writer.writeAll("th{background:#f5f5f5;font-weight:600}\n");
@@ -33,14 +41,38 @@ pub fn render(
     try writer.writeAll("<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css\">\n");
     try writer.writeAll("<script src=\"https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js\"></script>\n");
     try writer.writeAll("<script src=\"https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js\"></script>\n");
-    try writer.writeAll("</head>\n<body>\n<article>\n");
+    try writer.writeAll("</head>\n<body>\n");
+    if (pg.header_left != null or pg.header_center != null or pg.header_right != null) {
+        try writer.writeAll("<header class=\"page-header\" style=\"display:none\">\n");
+        try writer.writeAll("<span style=\"float:left\">");
+        if (pg.header_left) |s| try escapeHtml(writer, s);
+        try writer.writeAll("</span><span style=\"float:right\">");
+        if (pg.header_right) |s| try escapeHtml(writer, s);
+        try writer.writeAll("</span><span style=\"display:block;text-align:center\">");
+        if (pg.header_center) |s| try escapeHtml(writer, s);
+        try writer.writeAll("</span></header>\n");
+        try writer.writeAll("<style>@media print{.page-header{display:block!important}}</style>\n");
+    }
+    try writer.writeAll("<article>\n");
 
     for (doc.content.items) |node| {
         try renderNode(allocator, node, resolver, writer);
     }
 
     try writer.writeAll("<script>document.addEventListener(\"DOMContentLoaded\",function(){if(typeof renderMathInElement!==\"undefined\")renderMathInElement(document.body,{delimiters:[{left:\"\\\\[\",right:\"\\\\]\",display:true}]});});</script>\n");
-    try writer.writeAll("</article>\n</body>\n</html>\n");
+    try writer.writeAll("</article>\n");
+    if (pg.footer_left != null or pg.footer_center != null or pg.footer_right != null) {
+        try writer.writeAll("<footer class=\"page-footer\" style=\"display:none\">\n");
+        try writer.writeAll("<span style=\"float:left\">");
+        if (pg.footer_left) |s| try escapeHtml(writer, s);
+        try writer.writeAll("</span><span style=\"float:right\">");
+        if (pg.footer_right) |s| try escapeHtml(writer, s);
+        try writer.writeAll("</span><span style=\"display:block;text-align:center\">");
+        if (pg.footer_center) |s| try escapeHtml(writer, s);
+        try writer.writeAll("</span></footer>\n");
+        try writer.writeAll("<style>@media print{.page-footer{display:block!important}}</style>\n");
+    }
+    try writer.writeAll("</body>\n</html>\n");
 }
 
 fn renderNode(

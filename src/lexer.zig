@@ -146,10 +146,14 @@ pub const Lexer = struct {
             }
         }
 
-        // 脚本块结束 }
+        // 脚本块结束 }（仅当 } 位于行首，即前一个非空格/制表符为换行）
         if (c == '}' and self.pos > 0) {
             var i: usize = self.pos;
-            while (i > 0 and std.ascii.isWhitespace(self.source[i - 1])) i -= 1;
+            while (i > 0) {
+                const prev = self.source[i - 1];
+                if (prev == ' ' or prev == '\t') i -= 1
+                else break;
+            }
             if (i > 0 and self.source[i - 1] == '\n') {
                 _ = self.advance();
                 return Token{ .type = .script_end, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };

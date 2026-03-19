@@ -92,6 +92,12 @@ pub fn main() !void {
         return;
     };
 
+    // ztype init - 初始化包配置
+    if (std.mem.eql(u8, inp, "init")) {
+        try runInit(allocator);
+        return;
+    }
+
     const source = std.fs.cwd().readFileAlloc(allocator, inp, 10 * 1024 * 1024) catch |err| {
         std.log.err("无法读取文件 {s}: {}\n", .{ inp, err });
         return;
@@ -104,6 +110,16 @@ pub fn main() !void {
         return;
     };
     defer doc.deinit();
+
+    // 展开 %% include 指令（路径相对于输入文件所在目录）
+    const base_dir = blk: {
+        const sep = std.mem.lastIndexOfScalar(u8, inp, '/');
+        break :blk if (sep) |i| inp[0..i] else ".";
+    };
+    expandIncludes(allocator, &doc, base_dir, 0) catch |err| {
+        std.log.err("展开 include 失败: {}\n", .{err});
+        return;
+    };
 
     var resolver = Resolver.init(allocator);
     defer resolver.deinit();
@@ -143,9 +159,88 @@ pub fn main() !void {
     std.log.info("已输出: {s}\n", .{out_path});
 }
 
+fn expandIncludes(allocator: std.mem.Allocator, doc: *ast.Document, base_dir: []const u8, depth: u32) !void {
+    if (depth > 16) return error.IncludeDepthExceeded;
+
+    var i: usize = 0;
+    while (i < doc.content.items.len) {
+        const node = doc.content.items[i];
+        if (node == .page_directive) {
+            const pd = node.page_directive;
+            if (std.mem.eql(u8, pd.kind, "include") and pd.args.len > 0) {
+                const path = try resolveIncludePath(allocator, base_dir, pd.args);
+                defer allocator.free(path);
+
+                const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+                    std.log.err("无法读取 include 文件 {s}: {}\n", .{ path, err });
+                    return err;
+                };
+                defer allocator.free(source);
+
+                var sub_parser = Parser.init(allocator, source);
+                var included_doc = sub_parser.parse() catch |err| {
+                    std.log.err("解析 include 文件 {s} 失败: {}\n", .{ path, err });
+                    return err;
+                };
+                defer included_doc.deinit();
+
+                const included_base = blk: {
+                    const sep = std.mem.lastIndexOfScalar(u8, path, '/');
+                    break :blk if (sep) |s| path[0..s] else ".";
+                };
+                try expandIncludes(allocator, &included_doc, included_base, depth + 1);
+
+                // 移除 include 指令节点
+                var removed = doc.content.orderedRemove(i);
+                removed.deinit(allocator);
+
+                // 插入展开后的内容
+                for (included_doc.content.items) |*n| {
+                    try doc.content.insert(i, n.*);
+                    i += 1;
+                }
+                included_doc.content.clearRetainingCapacity();
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn resolveIncludePath(allocator: std.mem.Allocator, base_dir: []const u8, rel_path: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, base_dir, ".")) {
+        return try allocator.dupe(u8, std.mem.trim(u8, rel_path, " \t"));
+    }
+    const path = try std.fs.path.join(allocator, &.{ base_dir, std.mem.trim(u8, rel_path, " \t") });
+    return path;
+}
+
+fn runInit(_: std.mem.Allocator) !void {
+    const content =
+        \\# Ztype 包配置文件
+        \\
+        \\[package]
+        \\name = "my-project"
+        \\version = "0.0.1"
+        \\description = ""
+        \\
+        \\# [dependencies]
+        \\# other-package = "0.1.0"
+        \\
+    ;
+    std.fs.cwd().writeFile(.{ .sub_path = "zt.toml", .data = content }) catch |err| {
+        std.log.err("无法创建 zt.toml: {}\n", .{err});
+        return err;
+    };
+    std.log.info("已创建 zt.toml\n", .{});
+}
+
 fn printUsage() void {
     std.log.info(
-        \\用法: ztype <input.zt> [选项]
+        \\用法: ztype <input.zt> [选项]  或  ztype init
+        \\
+        \\命令:
+        \\  init                初始化项目，创建 zt.toml
         \\
         \\选项:
         \\  -o, --output <path>  指定输出文件路径
@@ -154,11 +249,12 @@ fn printUsage() void {
         \\  -h, --help          显示此帮助
         \\
         \\示例:
-        \\  ztype doc.zt                    # 输出 doc.html
-        \\  ztype doc.zt -o out.html        # 输出 HTML
-        \\  ztype doc.zt -o out.pdf -f pdf  # 输出 PDF
+        \\  ztype init                       # 创建 zt.toml
+        \\  ztype doc.zt                     # 输出 doc.html
+        \\  ztype doc.zt -o out.html         # 输出 HTML
+        \\  ztype doc.zt -o out.pdf -f pdf   # 输出 PDF
         \\  ztype doc.zt -o out.rtf -f word # 输出 Word (RTF)
-        \\  ztype doc.zt --debug            # 调试模式
+        \\  ztype doc.zt --debug             # 调试模式
         \\
     , .{});
 }
@@ -240,6 +336,29 @@ test "render: PDF 输出" {
     defer buf.deinit();
     try pdf_render.render(allocator, &doc, &resolver, buf.writer());
     try std.testing.expect(std.mem.startsWith(u8, buf.items, "%PDF-1.4"));
+}
+
+test "parser: 脚本块与变量" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\---
+        \\title: 脚本测试
+        \\---
+        \\@{
+        \\  let version = "0.0.1"
+        \\}
+        \\
+        \\= 标题
+        \\
+        \\版本：@(version)
+    ;
+    var parser = Parser.init(allocator, source);
+    var doc = parser.parse() catch |err| {
+        std.debug.print("解析失败: {}\n", .{err});
+        return err;
+    };
+    defer doc.deinit();
+    try std.testing.expect(doc.content.items.len >= 2);
 }
 
 test "render: Word (RTF) 输出" {

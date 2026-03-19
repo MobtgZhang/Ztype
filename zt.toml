@@ -1,0 +1,11 @@
+# Ztype 包配置文件
+# 用于定义项目元数据和依赖
+
+[package]
+name = "ztype"
+version = "0.0.1"
+description = "A minimal, elegant typesetting language"
+
+# 依赖的 .zt 包（可选）
+# [dependencies]
+# my-components = "0.0.1"
