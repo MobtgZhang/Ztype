@@ -1,0 +1,122 @@
+---
+title:    Ztype 功能展示
+author:   Ztype 团队
+date:     2026-03-20
+lang:     zh
+paper:    A4
+margin:   2.5cm
+header_left: Ztype 排版系统
+header_right: 功能展示文档
+---
+
+@{
+  let version = "0.1.0"
+}
+
+= 欢迎使用 Ztype 排版系统
+
+Ztype 是一个现代、简洁、快速的排版系统，采用 Zig 语言编写。
+当前版本：@(version)。本文档展示了 Ztype 的主要功能。
+
+== 行内格式
+
+Ztype 支持多种行内格式标记：
+
+- 使用 `*文本*` 表示 *粗体*
+- 使用反引号表示 `行内代码`
+- 使用美元符号表示行内数学公式，例如 $E = mc^2$
+- 使用方括号和圆括号表示 [链接](https://github.com)
+
+=== 数学公式示例
+
+著名的欧拉公式 $e^{i\pi} + 1 = 0$ 被称为数学中最美丽的公式。
+二次方程 $ax^2 + bx + c = 0$ 的求根公式是：
+
+:: math
+   ---
+   x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}
+
+== 代码块
+
+:: code zig
+   caption: 示例：Hello World
+   ---
+   const std = @import("std");
+   pub fn main() void {
+       std.debug.print("Hello, Ztype!\n", .{});
+   }
+
+:: code python
+   caption: 示例：斐波那契数列
+   ---
+   def fibonacci(n):
+       if n <= 1:
+           return n
+       return fibonacci(n-1) + fibonacci(n-2)
+
+   for i in range(10):
+       print(fibonacci(i))
+
+== 引用
+
+:: quote
+   ---
+   程序设计的艺术在于组织复杂性的艺术；它是控制杂乱的艺术，尽可能避免引入混乱。
+   source: Edsger W. Dijkstra
+
+== 列表
+
+以下是 Ztype 系统的核心特性：
+
+- 书写优先，编程有度
+- 多格式输出支持 HTML、PDF、Word
+- 原生 CJK（中日韩）支持
+- 自动分页与文本换行
+- 语义化的文档结构
+- 内置变量与脚本能力
+- 包管理与文件引用
+
+== 表格
+
+| 功能 | 状态 |
+| < | ^ |
+| 多页 PDF | 已完成 |
+| 文本换行 | 已完成 |
+| CJK 支持 | 已完成 |
+| 页眉页脚 | 已完成 |
+| 行内格式 | 已完成 |
+
+== 提示框
+
+:: note
+   ---
+   Ztype 的设计参考了 LaTeX 的排版能力和 Typst 的现代语法，旨在提供一个既强大又易用的排版系统。
+
+:: tip
+   ---
+   使用 `ztype doc.zt -o output.pdf -f pdf` 命令可以将文档编译为 PDF 格式。
+
+:: warning
+   ---
+   PDF 中的 CJK 字符显示依赖系统安装的中文字体，请确保系统已安装 STSong、SimSun 或 Noto Sans CJK SC 等字体。
+
+== 中文排版测试
+
+中文排版需要特别注意字体选择、行距设置和标点处理。Ztype 通过内置的 CJK 字符检测和字体切换机制，实现了中文与英文的混合排版。每当检测到 CJK 字符时，系统会自动切换到专用的 CJK 字体进行渲染。
+
+"天行健，君子以自强不息。地势坤，君子以厚德载物。" 这是《易经》中的名句。
+
+%% pagebreak
+
+= 附录
+
+== 关于 Ztype
+
+Ztype 排版系统的设计哲学：
+
+- *简洁*：语法直观，学习成本低
+- *快速*：基于 Zig 编译，性能优越
+- *现代*：参考 Typst 的设计理念
+- *实用*：输出规范的 HTML、PDF、Word 文档
+
+本文档由 Ztype @(version) 生成。

@@ -59,7 +59,7 @@ pub fn render(
         try renderNode(allocator, node, resolver, writer);
     }
 
-    try writer.writeAll("<script>document.addEventListener(\"DOMContentLoaded\",function(){if(typeof renderMathInElement!==\"undefined\")renderMathInElement(document.body,{delimiters:[{left:\"\\\\[\",right:\"\\\\]\",display:true}]});});</script>\n");
+    try writer.writeAll("<script>document.addEventListener(\"DOMContentLoaded\",function(){if(typeof renderMathInElement!==\"undefined\")renderMathInElement(document.body,{delimiters:[{left:\"\\\\[\",right:\"\\\\]\",display:true},{left:\"\\\\(\",right:\"\\\\)\",display:false}]});});</script>\n");
     try writer.writeAll("</article>\n");
     if (pg.footer_left != null or pg.footer_center != null or pg.footer_right != null) {
         try writer.writeAll("<footer class=\"page-footer\" style=\"display:none\">\n");
@@ -278,6 +278,11 @@ fn renderSpan(
             try writer.writeAll("<sup title=\"");
             try escapeHtml(writer, f);
             try writer.writeAll("\">[?]</sup>");
+        },
+        .inline_math => |m| {
+            try writer.writeAll("<span class=\"math-inline\">\\(");
+            try escapeHtml(writer, m);
+            try writer.writeAll("\\)</span>");
         },
     }
 }

@@ -138,5 +138,6 @@ fn renderSpan(span: ast.Span, writer: anytype, indent: usize) !void {
         .expr => |e| try writer.print("  @({s})\n", .{e}),
         .ref_id => |r| try writer.print("  [-> {s}]\n", .{r}),
         .footnote => |f| try writer.print("  [^ {s}]\n", .{f}),
+        .inline_math => |m| try writer.print("  ${s}$\n", .{m}),
     }
 }

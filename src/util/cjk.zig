@@ -3,6 +3,13 @@
 
 const std = @import("std");
 
+pub fn hasNonAscii(s: []const u8) bool {
+    for (s) |c| {
+        if (c >= 128) return true;
+    }
+    return false;
+}
+
 /// 将 UTF-8 字符串编码为 RTF 格式，支持 CJK
 /// RTF 使用 \uN? 表示 Unicode 码点，? 是旧版阅读器的替换字符
 pub fn utf8ToRtf(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
@@ -120,4 +127,114 @@ fn escapePdfAscii(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     }
     try result.append(')');
     return result.toOwnedSlice();
+}
+
+/// Check if a Unicode codepoint is a CJK character (Chinese/Japanese/Korean)
+pub fn isCjk(cp: u21) bool {
+    return (cp >= 0x4E00 and cp <= 0x9FFF) or // CJK Unified Ideographs
+        (cp >= 0x3400 and cp <= 0x4DBF) or // CJK Extension A
+        (cp >= 0x20000 and cp <= 0x2A6DF) or // CJK Extension B
+        (cp >= 0x2A700 and cp <= 0x2B73F) or // CJK Extension C
+        (cp >= 0x2B740 and cp <= 0x2B81F) or // CJK Extension D
+        (cp >= 0xF900 and cp <= 0xFAFF) or // CJK Compatibility Ideographs
+        (cp >= 0x3000 and cp <= 0x303F) or // CJK Symbols and Punctuation
+        (cp >= 0xFF00 and cp <= 0xFFEF) or // Fullwidth Forms
+        (cp >= 0x3040 and cp <= 0x309F) or // Hiragana
+        (cp >= 0x30A0 and cp <= 0x30FF) or // Katakana
+        (cp >= 0xAC00 and cp <= 0xD7AF); // Hangul Syllables
+}
+
+/// Estimate the width of a single codepoint in PDF points at a given font size.
+/// CJK characters are full-width (1.0 * font_size), Latin characters use
+/// approximate Helvetica metrics.
+pub fn charWidthPt(cp: u21, font_size: f64) f64 {
+    if (isCjk(cp)) return font_size;
+    return switch (cp) {
+        ' ' => font_size * 0.278,
+        'i', 'l', '!' => font_size * 0.278,
+        'f', 'j', 'r', 't' => font_size * 0.333,
+        'm', 'w' => font_size * 0.778,
+        'M', 'W' => font_size * 0.833,
+        else => if (cp >= 'A' and cp <= 'Z')
+            font_size * 0.667
+        else if (cp >= 'a' and cp <= 'z')
+            font_size * 0.500
+        else if (cp >= '0' and cp <= '9')
+            font_size * 0.556
+        else
+            font_size * 0.500,
+    };
+}
+
+/// Measure the width of a UTF-8 string in PDF points
+pub fn measureTextWidth(s: []const u8, font_size: f64) f64 {
+    var width: f64 = 0;
+    var view = std.unicode.Utf8View.init(s) catch return @as(f64, @floatFromInt(s.len)) * font_size * 0.5;
+    var iter = view.iterator();
+    while (iter.nextCodepoint()) |cp| {
+        width += charWidthPt(cp, font_size);
+    }
+    return width;
+}
+
+/// A text segment — either Latin (rendered with Helvetica) or CJK (rendered with CIDFont)
+pub const TextSegment = struct {
+    text: []const u8,
+    is_cjk: bool,
+};
+
+/// Split a UTF-8 string into alternating Latin/CJK segments for font switching
+pub fn splitTextSegments(allocator: std.mem.Allocator, s: []const u8) ![]TextSegment {
+    var segments = std.array_list.Managed(TextSegment).init(allocator);
+    errdefer {
+        for (segments.items) |seg| allocator.free(seg.text);
+        segments.deinit();
+    }
+
+    var view = std.unicode.Utf8View.init(s) catch {
+        try segments.append(.{ .text = try allocator.dupe(u8, s), .is_cjk = false });
+        return segments.toOwnedSlice();
+    };
+    var iter = view.iterator();
+
+    var buf = std.array_list.Managed(u8).init(allocator);
+    defer buf.deinit();
+    var current_is_cjk = false;
+    var first = true;
+
+    const bytes = iter.bytes;
+    _ = bytes;
+    var prev_i = iter.i;
+
+    while (iter.nextCodepoint()) |cp| {
+        const cp_is_cjk = isCjk(cp);
+        const cur_i = iter.i;
+        const char_bytes = s[prev_i..cur_i];
+
+        if (first) {
+            current_is_cjk = cp_is_cjk;
+            first = false;
+        }
+
+        if (cp_is_cjk != current_is_cjk and buf.items.len > 0) {
+            try segments.append(.{
+                .text = try allocator.dupe(u8, buf.items),
+                .is_cjk = current_is_cjk,
+            });
+            buf.clearRetainingCapacity();
+            current_is_cjk = cp_is_cjk;
+        }
+
+        try buf.appendSlice(char_bytes);
+        prev_i = cur_i;
+    }
+
+    if (buf.items.len > 0) {
+        try segments.append(.{
+            .text = try allocator.dupe(u8, buf.items),
+            .is_cjk = current_is_cjk,
+        });
+    }
+
+    return segments.toOwnedSlice();
 }

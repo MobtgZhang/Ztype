@@ -152,10 +152,11 @@ pub const Span = union(enum) {
     expr: []const u8, // @(expr)
     ref_id: []const u8, // [->id]
     footnote: []const u8,
+    inline_math: []const u8, // $...$
 
     pub fn deinit(self: *Span, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .text, .bold, .italic, .code, .expr, .ref_id, .footnote => |s| allocator.free(s),
+            .text, .bold, .italic, .code, .expr, .ref_id, .footnote, .inline_math => |s| allocator.free(s),
             .link => |*l| l.deinit(allocator),
         }
     }

@@ -386,7 +386,9 @@ pub const Parser = struct {
         var para = ast.Paragraph.init(self.allocator);
         errdefer para.deinit(self.allocator);
 
-        var text_buf = std.array_list.Managed(u8).init(self.allocator);
+        var raw_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer raw_buf.deinit();
+
         while (try self.nextToken()) |t| {
             if (t.type == .newline) {
                 try self.skipWhitespace();
@@ -394,32 +396,136 @@ pub const Parser = struct {
                 if (pt == null) break;
                 if (pt.?.type == .heading or pt.?.type == .block_start or pt.?.type == .script_start or
                     pt.?.type == .directive_start or pt.?.type == .list_dash or pt.?.type == .table_pipe) break;
-                try text_buf.append(' ');
+                try raw_buf.append(' ');
                 continue;
             }
             if (t.type == .expr_start) {
-                if (text_buf.items.len > 0) {
-                    try para.spans.append(.{ .text = try text_buf.toOwnedSlice() });
-                    text_buf = std.array_list.Managed(u8).init(self.allocator);
-                }
-                var expr_buf = std.array_list.Managed(u8).init(self.allocator);
+                try raw_buf.appendSlice("@(");
                 while (try self.nextToken()) |et| {
                     if (et.type == .expr_end) break;
-                    try expr_buf.appendSlice(self.slice(et));
+                    try raw_buf.appendSlice(self.slice(et));
                 }
-                try para.spans.append(.{ .expr = try expr_buf.toOwnedSlice() });
+                try raw_buf.append(')');
                 continue;
             }
-            if (t.type == .literal or t.type == .identifier or t.type == .string or t.type == .space) {
-                try text_buf.appendSlice(self.slice(t));
-            }
+            try raw_buf.appendSlice(self.slice(t));
         }
 
-        if (text_buf.items.len > 0) {
-            try para.spans.append(.{ .text = try text_buf.toOwnedSlice() });
-        }
-
+        try parseInlineSpans(self.allocator, raw_buf.items, &para.spans);
         return para;
+    }
+
+    fn parseInlineSpans(allocator: std.mem.Allocator, raw: []const u8, spans: *std.array_list.Managed(ast.Span)) !void {
+        var pos: usize = 0;
+        var text_start: usize = 0;
+
+        while (pos < raw.len) {
+            const c = raw[pos];
+
+            // @(expr) — variable expression
+            if (c == '@' and pos + 1 < raw.len and raw[pos + 1] == '(') {
+                if (pos > text_start) {
+                    try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+                }
+                const expr_start = pos + 2;
+                var depth: u32 = 1;
+                var ep = expr_start;
+                while (ep < raw.len) : (ep += 1) {
+                    if (raw[ep] == '(') depth += 1
+                    else if (raw[ep] == ')') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                }
+                try spans.append(.{ .expr = try allocator.dupe(u8, raw[expr_start..ep]) });
+                pos = if (ep < raw.len) ep + 1 else ep;
+                text_start = pos;
+                continue;
+            }
+
+            // *bold*
+            if (c == '*') {
+                if (findClosingMarker(raw, pos + 1, '*')) |end| {
+                    if (end > pos + 1) {
+                        if (pos > text_start) {
+                            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+                        }
+                        try spans.append(.{ .bold = try allocator.dupe(u8, raw[pos + 1 .. end]) });
+                        pos = end + 1;
+                        text_start = pos;
+                        continue;
+                    }
+                }
+            }
+
+            // `code`
+            if (c == '`') {
+                if (findClosingMarker(raw, pos + 1, '`')) |end| {
+                    if (end > pos + 1) {
+                        if (pos > text_start) {
+                            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+                        }
+                        try spans.append(.{ .code = try allocator.dupe(u8, raw[pos + 1 .. end]) });
+                        pos = end + 1;
+                        text_start = pos;
+                        continue;
+                    }
+                }
+            }
+
+            // $inline math$
+            if (c == '$') {
+                if (findClosingMarker(raw, pos + 1, '$')) |end| {
+                    if (end > pos + 1) {
+                        if (pos > text_start) {
+                            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+                        }
+                        try spans.append(.{ .inline_math = try allocator.dupe(u8, raw[pos + 1 .. end]) });
+                        pos = end + 1;
+                        text_start = pos;
+                        continue;
+                    }
+                }
+            }
+
+            // [text](url) — link
+            if (c == '[') {
+                if (findClosingMarker(raw, pos + 1, ']')) |text_end| {
+                    if (text_end + 1 < raw.len and raw[text_end + 1] == '(') {
+                        if (findClosingMarker(raw, text_end + 2, ')')) |url_end| {
+                            if (pos > text_start) {
+                                try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+                            }
+                            const link_text = try allocator.dupe(u8, raw[pos + 1 .. text_end]);
+                            const link_url = try allocator.dupe(u8, raw[text_end + 2 .. url_end]);
+                            try spans.append(.{ .link = .{ .text = link_text, .url = link_url } });
+                            pos = url_end + 1;
+                            text_start = pos;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            pos += 1;
+        }
+
+        if (pos > text_start) {
+            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+        }
+    }
+
+    fn findClosingMarker(text: []const u8, start: usize, marker: u8) ?usize {
+        var i = start;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '\\' and i + 1 < text.len) {
+                i += 1;
+                continue;
+            }
+            if (text[i] == marker) return i;
+            if (text[i] == '\n') return null;
+        }
+        return null;
     }
 
     fn parseList(self: *Parser) !ast.List {
@@ -431,19 +537,34 @@ pub const Parser = struct {
             _ = try self.nextToken();
             try self.skipWhitespace();
 
-            var item = ast.Paragraph.init(self.allocator);
+            var raw_buf = std.array_list.Managed(u8).init(self.allocator);
+            defer raw_buf.deinit();
+
             while (try self.nextToken()) |it| {
                 if (it.type == .newline) {
                     try self.skipWhitespace();
                     const pt = try self.peekToken();
-                    if (pt == null or pt.?.type != .list_dash and pt.?.type != .table_pipe) {}
                     if (pt != null and pt.?.type == .list_dash) break;
-                    if (pt != null and (pt.?.type == .heading or pt.?.type == .block_start)) break;
-                    try item.spans.append(.{ .text = try self.allocator.dupe(u8, " ") });
+                    if (pt != null and (pt.?.type == .heading or pt.?.type == .block_start or
+                        pt.?.type == .script_start or pt.?.type == .directive_start)) break;
+                    if (pt == null) break;
+                    try raw_buf.append(' ');
                     continue;
                 }
-                try item.spans.append(.{ .text = try self.allocator.dupe(u8, self.slice(it)) });
+                if (it.type == .expr_start) {
+                    try raw_buf.appendSlice("@(");
+                    while (try self.nextToken()) |et| {
+                        if (et.type == .expr_end) break;
+                        try raw_buf.appendSlice(self.slice(et));
+                    }
+                    try raw_buf.append(')');
+                    continue;
+                }
+                try raw_buf.appendSlice(self.slice(it));
             }
+
+            var item = ast.Paragraph.init(self.allocator);
+            try parseInlineSpans(self.allocator, raw_buf.items, &item.spans);
             try list.items.append(item);
         }
 

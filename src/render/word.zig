@@ -66,6 +66,11 @@ fn renderSpanRtf(
             try escapeRtfWithAlloc(allocator, writer, s);
         },
         .ref_id, .footnote => |s| try escapeRtfWithAlloc(allocator, writer, s),
+        .inline_math => |m| {
+            try writer.writeAll("\\i ");
+            try escapeRtfWithAlloc(allocator, writer, m);
+            try writer.writeAll("\\i0 ");
+        },
     }
 }
 
