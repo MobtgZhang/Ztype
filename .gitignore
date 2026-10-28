@@ -1,3 +1,12 @@
+# Build cache and output
 .zig-cache/
 zig-out/
 *.o
+
+# Generated documents
+output/
+*.pdf
+*.rtf
+
+# Third-party reference material: kept locally, never uploaded
+external/
