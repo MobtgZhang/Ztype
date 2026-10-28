@@ -1,0 +1,49 @@
+---
+title:    双栏排版示例
+author:   Ztype
+date:     2026-10-28
+lang:     zh
+paper:    A4
+margin:   2cm
+columns:  2
+column_gap: 18pt
+fontsize: 10pt
+justify:  true
+footer_center: {{page}} / {{pages}}
+---
+
+= 双栏排版
+
+栏宽由版心宽度减去栏间距后平均分配。断行、两端对齐、悬挂标点都按当前栏宽计算，
+因此每一栏的右边界都能对齐。
+
+中文与英文混排时，CJK 字符之间产生可伸缩但自然宽度为零的 glue，两端对齐仍然生效；
+行首禁则与行末禁则保证标点不会出现在错误的位置。
+
+== 断词
+
+Typography is the art and technique of arranging type to make written language
+legible, readable, and appealing when displayed. The arrangement of type involves
+selecting typefaces, modifying point size or line spacing, adjusting letter-spacing,
+and tweaking word-spacing, as well as applying optimum line lengths.
+
+Hyphenation follows the Knuth–Liang pattern matching algorithm, so long words such
+as typography, hyphenation, and characteristic are broken at the strongest pattern
+positions rather than arbitrarily.
+
+%% pagebreak
+
+== 跨栏流动
+
+内容按栏顺序流动，填满一栏后进入下一栏；一页内所有栏填满才翻页。表格、代码块和
+图片按当前栏宽排版。
+
+%% columnbreak
+
+`%% columnbreak` 立即结束当前栏，从下一栏继续；栏底的脚注放不下时整组顺延到下一栏。
+
+:: code text
+---
+columnWidth() = (contentWidth() - (columns - 1) * column_gap) / columns
+colX(i)       = margins.left + i * (columnWidth() + column_gap)
+---

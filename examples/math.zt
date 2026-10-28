@@ -1,0 +1,54 @@
+---
+title:    数学排版示例
+author:   Ztype
+date:     2026-10-28
+lang:     zh
+fontsize: 11pt
+---
+
+= 数学排版
+
+语法以 Typst 为主，同时接受常见的 LaTeX 别名。行内公式如 $a^2 + b^2 = c^2$ 与正文
+混排，独立公式自动编号。
+
+== 求和与积分
+
+$$ sum_(i=1)^n i = frac(n(n+1), 2) tag(1) $$
+
+$$ int_0^infty e^(-x^2) dx = frac(1, 2) sqrt(pi) $$
+
+`notag()` 用于关闭某一式的编号：
+
+$$ e^(i pi) = -1 notag() $$
+
+== 矩阵与分段
+
+$$ mat(a, b; c, d) $$
+
+$$ mat(p)(x, y; z, w) $$
+
+$$ cases(x > 0, 1; x < 0, -1; otherwise, 0) $$
+
+== 分式、根式与二项式
+
+$$ frac(1, 2) + tfrac(1, 3) $$
+
+$$ sqrt[3](x) = root(3)(x) $$
+
+$$ binom(n, k) = frac(n!, k!(n-k)!) $$
+
+== 重音与样式
+
+$$ hat(x) bar(x) tilde(x) vec(x) ddot(x) cancel(x) $$
+
+$$ mathbb R supset mathbb Q mathcal L mathfrak H $$
+
+== 间距
+
+$$ x thin y medium z thick w quad v qquad u $$
+
+== 函数与极限
+
+$$ lim_(x->0) frac(sin(x), x) = 1 $$
+
+$$ gcd(a, b) = gcd(b, a mod b) $$

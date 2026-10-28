@@ -1,0 +1,75 @@
+---
+title:    排版引擎中的断行问题
+author:   Ztype
+date:     2026-10-28
+lang:     zh
+paper:    A4
+margin:   2.5cm
+fontsize: 11pt
+justify:  true
+toc:      true
+toc_depth: 3
+numbering: true
+pagenum:  arabic
+front_pagenum: roman_lower
+front_matter: 1
+plain_first_page: true
+header_left:   @(title)
+header_right:  {{section}}
+footer_center: {{page}} / {{pages}}
+---
+
+%% toc
+
+= 引言
+
+断行是排版中最基础也最关键的一步。TeX 把一行文本切成 run、glue 与 discretionary
+三种 token，再用动态规划最小化总 demerit：
+
+$$ demerit = (1 + 可伸缩度) times badness + penalty $$
+
+其中 $badness = ((版心宽度 - 自然宽度) / 版心宽度)^2 times 10000$。这一模型出自
+Knuth 的工作 [@knuth]，Typst 采用了同样的思路 [@typst]。
+
+[^脚注会累积到所在页的底部，并由规则线与正文分隔。]
+
+== 惩罚项
+
+| 惩罚 | 值 | 说明 |
+| < | > | < |
+| hyphenpenalty | 50 | 断词处断行 |
+| brokenpenalty | 50 | 连续两行都以断词结尾 |
+| exhyphenpenalty | 100 | 已有连字符处断行 |
+| clubpenalty | 150 | 两行孤立在页尾 |
+| widowpenalty | 150 | 单行出现在页首 |
+
+:: table
+caption: 断行惩罚
+id: tab-penalty
+---
+| 惩罚 | 值 | 说明 |
+| < | > | < |
+| hyphenpenalty | 50 | 断词处断行 |
+| brokenpenalty | 50 | 连续两行都以断词结尾 |
+| exhyphenpenalty | 100 | 已有连字符处断行 |
+---
+
+如 [tab-penalty] 所示，最后一行只惩罚过宽，不惩罚过短。
+
+== 对齐与压缩
+
+两端对齐时，多余宽度按各 glue 的可伸缩度比例分配，而不是平均分摊。分配结果限制在
+$[-0.30 times 字号, +0.15 times 字号]$ 之间：超出上限宁可让行尾参差，也不产生
+视觉上的"河流"。
+
+%% pagebreak
+
+= 结论
+
+一个好的排版引擎应当同时尊重 TeX 的模型与现代的视觉风格：度量精确、惩罚可解释、
+标点有光学对齐，并且默认值就能产出可读的结果。
+
+:: bibliography
+---
+knuth: Knuth, D. E. *Computer Modern Typography*. CSLI, 1999.
+typst: Cozens, C. *Typst: Reliable and Beautiful Document Preparation*. 2024.
