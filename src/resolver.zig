@@ -2,6 +2,7 @@
 //! 变量替换、@() 表达式求值、交叉引用解析
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast.zig");
 
 pub const Resolver = struct {
@@ -113,13 +114,18 @@ pub const Resolver = struct {
     }
 
     fn evalToday(self: *const Resolver) !?[]const u8 {
-        const timestamp = std.time.timestamp();
-        const epoch_day: i64 = @intCast(@divFloor(timestamp, 86400));
-        const day = @rem(epoch_day, 31) + 1;
-        const month = @rem(@divFloor(epoch_day, 31), 12) + 1;
-        const year = @divFloor(epoch_day, 31 * 12) + 1970;
+        if (builtin.os.tag != .linux) return null;
+        var tv = std.os.linux.timeval{ .sec = 0, .usec = 0 };
+        _ = std.os.linux.gettimeofday(&tv, null);
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(tv.sec) };
+        const year_day = epoch.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
         var buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}-{:0>2}-{:0>2}", .{ year, month, day }) catch return null;
+        const s = std.fmt.bufPrint(&buf, "{d}-{:0>2}-{:0>2}", .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+        }) catch return null;
         return try self.allocator.dupe(u8, s);
     }
 };
