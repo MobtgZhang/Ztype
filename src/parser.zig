@@ -1,618 +1,674 @@
 //! Ztype 语法解析器
-//! 将词法 Token 流解析为 AST
+//! 把行法分析器输出的逻辑行解析为 AST。
+//!
+//! 语法概览：
+//!   ---                     元数据块（key: value）
+//!   = .. ======             1-6 级标题，可带 [id]
+//!   - / + / 1.              无序、有序列表（缩进表示嵌套）
+//!   | a | b |               表格行；| < | ^ | > | 为对齐行
+//!   :: figure|code|quote|note|...  语义块，属性后用 --- 分隔内容
+//!   %% pagebreak|toc|rule|include   页面指令
+//!   @{ ... }                脚本块
+//!   *粗体* _斜体_ `代码` $公式$ [链接](url) [->引用] [^脚注] @(表达式) ^上标^ ~下标~
+//!   ; 行注释   ;{ 块注释 }
 
 const std = @import("std");
 const ast = @import("ast.zig");
-const Lexer = @import("lexer.zig").Lexer;
-const Token = ast.Token;
-const TokenType = ast.TokenType;
+const lexer = @import("lexer.zig");
+const math = @import("math.zig");
+const typography = @import("util/typography.zig");
 
 pub const ParseError = error{
-    UnexpectedToken,
-    ExpectedIdentifier,
+    Parse,
+    OutOfMemory,
     InvalidMetadata,
+    InvalidBlock,
+    MathParse,
 };
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
-    source: []const u8,
-    lexer: Lexer,
-    current: ?Token = null,
-    peeked: ?Token = null,
+    lexer: lexer.Lexer,
+    base_dir: []const u8 = ".",
+    io: std.Io,
+    /// 智能排版开关（可用元数据 smart: false 关闭）
+    smart: typography.Options = typography.defaults,
+    /// 引号方向等跨片段上下文
+    state: typography.State = .{},
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, source: []const u8) !Parser {
         return .{
             .allocator = allocator,
-            .source = source,
-            .lexer = Lexer.init(allocator, source),
+            .lexer = try lexer.Lexer.init(allocator, source),
+            .io = io,
         };
     }
 
-    fn nextToken(self: *Parser) !?Token {
-        if (self.peeked) |t| {
-            self.peeked = null;
-            self.current = t;
-            return t;
-        }
-        const t = try self.lexer.next();
-        self.current = t;
-        return t;
+    pub fn setBaseDir(self: *Parser, dir: []const u8) void {
+        self.base_dir = dir;
     }
 
-    fn peekToken(self: *Parser) !?Token {
-        if (self.peeked) |t| return t;
-        self.peeked = try self.lexer.next();
-        return self.peeked;
+    pub fn setSmart(self: *Parser, opts: typography.Options) void {
+        self.smart = opts;
     }
 
-    fn slice(self: *Parser, token: Token) []const u8 {
-        return self.source[token.start..token.end];
-    }
+    pub fn parse(self: *Parser) ParseError!ast.Document {
+        var content = std.array_list.Managed(ast.Block).init(self.allocator);
+        var metadata = ast.Metadata{ .values = std.StringHashMap([]const u8).init(self.allocator) };
 
-    fn skipWhitespace(self: *Parser) !void {
-        while (try self.peekToken()) |t| {
-            switch (t.type) {
-                .space, .newline => _ = try self.nextToken(),
-                else => break,
-            }
-        }
-    }
-
-    pub fn parse(self: *Parser) !ast.Document {
-        var doc = ast.Document.init(self.allocator);
-        errdefer doc.deinit();
-
-        const first = try self.nextToken();
-
-        // 可选的元数据块
-        if (first) |t| {
-            if (t.type == .meta_start) {
-                doc.metadata = try self.parseMetadata();
-            } else {
-                self.peeked = t;
-            }
-        } else if (first) |t| {
-            // 非元数据时，将第一个 token 放回供主循环处理
-            self.peeked = t;
-        }
-
-        try self.skipWhitespace();
-
-        // 解析主体内容
-        while (true) {
-            try self.skipWhitespace();
-            const next = try self.peekToken();
-            if (next == null) break;
-
-            const tok = next.?;
-            switch (tok.type) {
-                .meta_start, .meta_end => {
-                    _ = try self.nextToken();
-                },
-                .heading => {
-                    try doc.content.append(try self.parseHeading());
-                },
-                .script_start => {
-                    try doc.content.append(.{ .script_block = try self.parseScriptBlock() });
-                },
-                .block_start => {
-                    try doc.content.append(.{ .semantic_block = try self.parseSemanticBlock() });
-                },
-                .directive_start => {
-                    try doc.content.append(.{ .page_directive = try self.parsePageDirective() });
-                },
-                .comment_start => {
-                    _ = try self.parseComment();
-                },
-                .comment_block_start => {
-                    _ = try self.parseCommentBlock();
-                },
-                .list_dash => {
-                    try doc.content.append(.{ .list = try self.parseList() });
-                },
-                .table_pipe => {
-                    try doc.content.append(.{ .table = try self.parseTable() });
-                },
-                .newline, .space => {
-                    _ = try self.nextToken();
-                },
-                else => {
-                    // 段落或正文
-                    if (self.hasParagraphContent(tok)) {
-                        try doc.content.append(.{ .paragraph = try self.parseParagraph() });
-                    } else {
-                        _ = try self.nextToken();
-                    }
-                },
-            }
-        }
-
-        return doc;
-    }
-
-    fn hasParagraphContent(self: *Parser, t: Token) bool {
-        _ = self;
-        return switch (t.type) {
-            .identifier, .string, .literal, .expr_start => true,
-            else => false,
-        };
-    }
-
-    fn parseMetadata(self: *Parser) !ast.Metadata {
-        var meta = ast.Metadata.init(self.allocator);
-        errdefer meta.deinit(self.allocator);
-
-        _ = try self.nextToken(); // consume meta_start
-        try self.skipWhitespace();
-
-        while (try self.nextToken()) |t| {
-            if (t.type == .meta_end) break;
-            try self.skipWhitespace();
-
-            if (t.type == .identifier) {
-                const key = try self.allocator.dupe(u8, self.slice(t));
-                try self.skipWhitespace();
-
-                const colon_t = try self.nextToken();
-                if (colon_t == null or colon_t.?.type != .colon) continue;
-                try self.skipWhitespace();
-
-                const value_t = try self.nextToken();
-                if (value_t) |vt| {
-                    var value_str = std.array_list.Managed(u8).init(self.allocator);
-                    if (vt.type == .string) {
-                        const raw = self.slice(vt);
-                        if (raw.len >= 2) {
-                            try value_str.appendSlice(raw[1 .. raw.len - 1]);
-                        }
-                    } else if (vt.type == .identifier or vt.type == .literal) {
-                        try value_str.appendSlice(self.slice(vt));
-                    }
-                    // 同行内可能有更多 literal/identifier（不消耗换行，以免吃掉下一行 key）
-                    while (try self.peekToken()) |pt| {
-                        if (pt.type == .newline or pt.type == .meta_end) break;
-                        _ = try self.nextToken();
-                        if (pt.type == .space) {
-                            try value_str.append(' ');
-                        } else if (pt.type == .literal or pt.type == .identifier) {
-                            if (value_str.items.len > 0 and value_str.items[value_str.items.len - 1] != ' ')
-                                try value_str.append(' ');
-                            try value_str.appendSlice(self.slice(pt));
-                        }
-                    }
-                    const value = try value_str.toOwnedSlice();
-                    try meta.pairs.put(key, value);
+        if (self.lexer.peek()) |first| {
+            if (!first.blank and std.mem.eql(u8, first.text, "---")) {
+                _ = self.lexer.next();
+                while (self.lexer.next()) |line| {
+                    if (std.mem.eql(u8, line.text, "---")) break;
+                    if (line.blank) continue;
+                    const sep = std.mem.indexOfScalar(u8, line.text, ':') orelse return ParseError.InvalidMetadata;
+                    const key = std.mem.trim(u8, line.text[0..sep], " \t");
+                    const value = std.mem.trim(u8, line.text[sep + 1 ..], " \t");
+                    try metadata.values.put(try self.allocator.dupe(u8, key), try self.allocator.dupe(u8, value));
                 }
             }
         }
 
-        return meta;
-    }
-
-    fn parseHeading(self: *Parser) !ast.Node {
-        const t = (try self.nextToken()).?;
-        const level: u8 = switch (t.extra) {
-            .heading_level => |l| l,
-            .none => 1,
-        };
-        try self.skipWhitespace();
-
-        var text_buf = std.array_list.Managed(u8).init(self.allocator);
-        var has_id = false;
-        var id_buf = std.array_list.Managed(u8).init(self.allocator);
-
-        while (try self.nextToken()) |nt| {
-            if (nt.type == .newline) break;
-            if (nt.type == .identifier and std.mem.eql(u8, self.slice(nt), "#")) {
-                has_id = true;
-                try self.skipWhitespace();
-                const id_t = try self.nextToken();
-                if (id_t) |it| {
-                    if (it.type == .identifier) {
-                        try id_buf.appendSlice(self.slice(it));
-                    }
-                }
-                break;
-            }
-            if (nt.type != .space) {
-                if (text_buf.items.len > 0) try text_buf.append(' ');
-                try text_buf.appendSlice(self.slice(nt));
-            }
+        if (metadata.get("smart")) |v| {
+            self.smart.quotes = !(std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "none") or std.mem.eql(u8, v, "off"));
+            self.smart.dashes = self.smart.quotes;
+            self.smart.ellipsis = self.smart.quotes;
+            self.smart.symbols = self.smart.quotes;
         }
 
-        const text = try text_buf.toOwnedSlice();
-        const id = if (has_id and id_buf.items.len > 0) try id_buf.toOwnedSlice() else null;
+        while (self.lexer.next()) |line| {
+            if (line.blank) continue;
+            if (try self.parseBlock(line, &content)) continue;
+        }
 
-        return .{
-            .heading = .{
+        return .{ .metadata = metadata, .content = try content.toOwnedSlice() };
+    }
+
+    // ---- 块级 ----
+
+    fn parseBlock(self: *Parser, line: lexer.Line, out: *std.array_list.Managed(ast.Block)) !bool {
+        const text = line.text;
+
+        if (std.mem.eql(u8, text, "---")) return false;
+
+        // 标题
+        if (text[0] == '=') {
+            var level: u8 = 0;
+            while (level < text.len and text[level] == '=') level += 1;
+            if (level == 0 or level > 6) return false;
+            const raw = std.mem.trim(u8, text[level..], " \t");
+            var id: ?[]const u8 = null;
+            var body = raw;
+            if (std.mem.endsWith(u8, raw, "]")) {
+                if (std.mem.indexOfScalar(u8, raw, '[')) |open| {
+                    id = try self.allocator.dupe(u8, raw[open + 1 .. raw.len - 1]);
+                    body = std.mem.trim(u8, raw[0..open], " \t");
+                }
+            }
+            try out.append(.{ .heading = .{
                 .level = level,
-                .text = text,
+                .text = try self.parseInline(body),
                 .id = id,
-            },
-        };
+            } });
+            return true;
+        }
+
+        // 页面指令
+        if (std.mem.startsWith(u8, text, "%%")) {
+            const name = std.mem.trim(u8, text[2..], " \t");
+            if (std.mem.eql(u8, name, "pagebreak") or std.mem.eql(u8, name, "page-break")) {
+                try out.append(.{ .page_break = {} });
+            } else if (std.mem.eql(u8, name, "columnbreak") or std.mem.eql(u8, name, "column-break")) {
+                try out.append(.{ .column_break = {} });
+            } else if (std.mem.eql(u8, name, "toc")) {
+                try out.append(.{ .toc = {} });
+            } else if (std.mem.eql(u8, name, "rule") or std.mem.eql(u8, name, "hr")) {
+                try out.append(.{ .rule = {} });
+            } else if (std.mem.startsWith(u8, name, "include ")) {
+                try self.parseInclude(std.mem.trim(u8, name[8..], " \t"), out);
+            }
+            return true;
+        }
+
+        // 脚本块
+        if (std.mem.startsWith(u8, text, "@{")) {
+            var body = std.array_list.Managed(u8).init(self.allocator);
+            try body.appendSlice(text[2..]);
+            while (self.lexer.next()) |l| {
+                if (std.mem.eql(u8, l.text, "}")) break;
+                try body.append('\n');
+                try body.appendSlice(l.text);
+            }
+            try out.append(.{ .script = .{ .source = try body.toOwnedSlice() } });
+            return true;
+        }
+
+        // 语义块
+        if (std.mem.startsWith(u8, text, "::")) {
+            try self.parseSemanticBlock(std.mem.trim(u8, text[2..], " \t"), out);
+            return true;
+        }
+
+        // 表格
+        if (text[0] == '|') {
+            try self.parseTable(text, out);
+            return true;
+        }
+
+        // 列表
+        if (isListMarker(text)) {
+            try self.parseList(line, out);
+            return true;
+        }
+
+        // 段落：收集到下一个空行
+        var lines = std.array_list.Managed([]const u8).init(self.allocator);
+        try lines.append(text);
+        while (self.lexer.peek()) |nxt| {
+            if (nxt.blank) break;
+            if (isBlockStart(nxt.text)) break;
+            _ = self.lexer.next();
+            try lines.append(nxt.text);
+        }
+        var joined = std.array_list.Managed(u8).init(self.allocator);
+        for (lines.items, 0..) |l, i| {
+            if (i > 0) try joined.append(' ');
+            try joined.appendSlice(l);
+        }
+        try self.appendParagraph(try joined.toOwnedSlice(), out);
+        return true;
     }
 
-    fn parseScriptBlock(self: *Parser) !ast.ScriptBlock {
-        _ = try self.nextToken(); // script_start
-        const start_pos = self.lexer.pos;
-        var depth: u32 = 1;
+    fn isBlockStart(text: []const u8) bool {
+        if (text.len == 0) return false;
+        if (text[0] == '=' or text[0] == '|' or text[0] == ';') return true;
+        if (text[0] == '-' and text.len >= 2 and std.ascii.isWhitespace(text[1])) return true;
+        if (std.mem.startsWith(u8, text, "::") or std.mem.startsWith(u8, text, "%%")) return true;
+        if (std.mem.startsWith(u8, text, "@{")) return true;
+        return false;
+    }
 
-        while (try self.nextToken()) |t| {
-            if (t.type == .script_start) depth += 1
-            else if (t.type == .script_end) {
-                depth -= 1;
-                if (depth == 0) {
-                    const end_pos = t.start;
-                    const source = try self.allocator.dupe(u8, self.source[start_pos..end_pos]);
-                    return .{ .source = source, .allocator = self.allocator };
+    fn isListMarker(text: []const u8) bool {
+        if (text.len < 2) return false;
+        if ((text[0] == '-' or text[0] == '+') and std.ascii.isWhitespace(text[1])) return true;
+        var i: usize = 0;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+        if (i > 0 and i + 1 <= text.len and text[i] == '.' and std.ascii.isWhitespace(text[i + 1])) return true;
+        return false;
+    }
+
+    fn parseList(self: *Parser, first: lexer.Line, out: *std.array_list.Managed(ast.Block)) ParseError!void {
+        var lines = std.array_list.Managed(lexer.Line).init(self.allocator);
+        try lines.append(first);
+        while (self.lexer.peek()) |nxt| {
+            if (nxt.blank or !isListMarker(nxt.text)) break;
+            _ = self.lexer.next();
+            try lines.append(nxt);
+        }
+
+        const ordered = isOrderedMarker(first.text);
+        const items = try self.buildListItems(lines.items, lines.items[0].indent / 2);
+        try out.append(.{ .list = .{ .items = items, .ordered = ordered } });
+    }
+
+    /// 按缩进深度递归构建列表树：同深度的行属于同一层，更深的行成为上一项的子列表
+    fn buildListItems(self: *Parser, lines: []const lexer.Line, depth: usize) ParseError![]ast.ListItem {
+        var items = std.array_list.Managed(ast.ListItem).init(self.allocator);
+        var i: usize = 0;
+        while (i < lines.len) {
+            var j = i + 1;
+            while (j < lines.len and lines[j].indent / 2 > depth) j += 1;
+            var item = try self.parseListItem(lines[i].text);
+            if (j > i + 1) item.children = try self.buildListItems(lines[i + 1 .. j], lines[i + 1].indent / 2);
+            try items.append(item);
+            i = j;
+        }
+        return try items.toOwnedSlice();
+    }
+
+    fn parseListItem(self: *Parser, raw: []const u8) ParseError!ast.ListItem {
+        var body = raw;
+        if (body[0] == '-' or body[0] == '+') {
+            body = std.mem.trim(u8, body[1..], " \t");
+        } else {
+            if (std.mem.indexOfScalar(u8, body, '.')) |dot| body = std.mem.trim(u8, body[dot + 1 ..], " \t");
+        }
+        return .{ .content = try self.parseInline(body) };
+    }
+
+    fn isOrderedMarker(text: []const u8) bool {
+        return std.ascii.isDigit(text[0]);
+    }
+
+    fn parseTable(self: *Parser, first: []const u8, out: *std.array_list.Managed(ast.Block)) ParseError!void {
+        var rows = std.array_list.Managed(ast.Row).init(self.allocator);
+        var alignments = std.array_list.Managed(ast.Alignment).init(self.allocator);
+        var widths = std.array_list.Managed(ast.ColumnWidth).init(self.allocator);
+
+        try rows.append(try self.parseTableRow(first));
+        while (self.lexer.peek()) |nxt| {
+            if (nxt.blank or nxt.text[0] != '|') break;
+            _ = self.lexer.next();
+            const cells = try self.parseTableRow(nxt.text);
+            var is_align = cells.len > 0;
+            for (cells) |cell| {
+                if (cell.len != 1 or cell[0] != .text or cell[0].text.len == 0) {
+                    is_align = false;
+                    break;
+                }
+                const c = cell[0].text[0];
+                if (c != '<' and c != '^' and c != '>') {
+                    is_align = false;
+                    break;
                 }
             }
-        }
-
-        return error.UnexpectedToken;
-    }
-
-    fn parseSemanticBlock(self: *Parser) !ast.SemanticBlock {
-        var block = ast.SemanticBlock.init(self.allocator);
-        errdefer block.deinit(self.allocator);
-
-        _ = try self.nextToken(); // block_start
-        try self.skipWhitespace();
-
-        // 块类型和修饰符 (e.g. :: code zig)
-        const type_t = try self.nextToken();
-        if (type_t) |tt| {
-            if (tt.type == .identifier) {
-                block.block_type = try self.allocator.dupe(u8, self.slice(tt));
-            }
-        }
-        try self.skipWhitespace();
-
-        const modifier_t = try self.peekToken();
-        if (modifier_t) |mt| {
-            if (mt.type == .identifier and !std.mem.eql(u8, self.slice(mt), "if") and
-                !std.mem.eql(u8, self.slice(mt), "for") and !std.mem.eql(u8, self.slice(mt), "else")) {
-                _ = try self.nextToken();
-                block.modifier = try self.allocator.dupe(u8, self.slice(mt));
-            }
-        }
-        try self.skipWhitespace();
-
-        const next = try self.peekToken();
-        if (if (next) |n| n.type == .newline else false) {
-            _ = try self.nextToken();
-            try self.skipWhitespace();
-
-            // 解析缩进属性 key: value
-            while (try self.nextToken()) |t| {
-                if (t.type == .block_separator) break;
-                if (t.type == .newline) {
-                    try self.skipWhitespace();
-                    const pt = try self.peekToken();
-                    if (pt == null) break;
-                    if (pt.?.type != .identifier) break;
-                    continue;
+            if (is_align) {
+                for (cells) |cell| {
+                    const spec = cell[0].text;
+                    try alignments.append(switch (spec[0]) {
+                        '<' => .left,
+                        '^' => .center,
+                        else => .right,
+                    });
+                    try widths.append(try self.parseColumnWidth(spec[1..]));
                 }
-                if (t.type == .identifier) {
-                    const key = try self.allocator.dupe(u8, self.slice(t));
-                    try self.skipWhitespace();
-                    const ct = try self.nextToken();
-                    if (ct != null and ct.?.type == .colon) {
-                        try self.skipWhitespace();
-                        const vt = try self.nextToken();
-                        if (vt) |v| {
-                            var val = std.array_list.Managed(u8).init(self.allocator);
-                            if (v.type == .string) {
-                                const raw = self.slice(v);
-                                if (raw.len >= 2) try val.appendSlice(raw[1 .. raw.len - 1]);
-                            } else {
-                                try val.appendSlice(self.slice(v));
-                            }
-                            const value = try val.toOwnedSlice();
-                            try block.attrs.put(key, value);
-                        }
-                    }
-                }
-            }
-
-            if (self.current != null and self.current.?.type == .block_separator) {
-                _ = try self.nextToken();
-                try self.skipWhitespace();
-                var content_buf = std.array_list.Managed(u8).init(self.allocator);
-                while (try self.nextToken()) |t| {
-                    if (t.type == .block_start) {
-                        // 嵌套块，暂时作为内容
-                        const tok_slice = self.slice(t);
-                        try content_buf.appendSlice(tok_slice);
-                        continue;
-                    }
-                    if (t.type == .newline) {
-                        try self.skipWhitespace();
-                        const pt = try self.peekToken();
-                        if (pt) |p| {
-                            if (p.type == .block_start or p.type == .heading or p.type == .script_start) break;
-                            if (p.type == .identifier and std.mem.startsWith(u8, self.slice(p), "::")) break;
-                        }
-                        try content_buf.append('\n');
-                        continue;
-                    }
-                    try content_buf.appendSlice(self.slice(t));
-                }
-                block.content = try content_buf.toOwnedSlice();
-            }
-        }
-
-        return block;
-    }
-
-    fn parsePageDirective(self: *Parser) !ast.PageDirective {
-        _ = try self.nextToken(); // directive_start
-        try self.skipWhitespace();
-
-        var args_buf = std.array_list.Managed(u8).init(self.allocator);
-        while (try self.nextToken()) |t| {
-            if (t.type == .newline) break;
-            if (t.type != .space or args_buf.items.len > 0) {
-                try args_buf.appendSlice(self.slice(t));
-            }
-        }
-
-        const kind_end = std.mem.indexOfScalar(u8, args_buf.items, ' ') orelse args_buf.items.len;
-        const kind = try self.allocator.dupe(u8, args_buf.items[0..kind_end]);
-        const args = if (kind_end < args_buf.items.len)
-            try self.allocator.dupe(u8, std.mem.trim(u8, args_buf.items[kind_end..], " "))
-        else
-            try self.allocator.dupe(u8, "");
-
-        args_buf.deinit();
-        return .{ .kind = kind, .args = args };
-    }
-
-    fn parseComment(self: *Parser) !void {
-        _ = try self.nextToken();
-        while (try self.nextToken()) |t| {
-            if (t.type == .newline) break;
-        }
-    }
-
-    fn parseCommentBlock(self: *Parser) !void {
-        _ = try self.nextToken();
-        while (try self.nextToken()) |t| {
-            if (t.type == .comment_block_end) break;
-        }
-    }
-
-    fn parseParagraph(self: *Parser) !ast.Paragraph {
-        var para = ast.Paragraph.init(self.allocator);
-        errdefer para.deinit(self.allocator);
-
-        var raw_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer raw_buf.deinit();
-
-        while (try self.nextToken()) |t| {
-            if (t.type == .newline) {
-                try self.skipWhitespace();
-                const pt = try self.peekToken();
-                if (pt == null) break;
-                if (pt.?.type == .heading or pt.?.type == .block_start or pt.?.type == .script_start or
-                    pt.?.type == .directive_start or pt.?.type == .list_dash or pt.?.type == .table_pipe) break;
-                try raw_buf.append(' ');
                 continue;
             }
-            if (t.type == .expr_start) {
-                try raw_buf.appendSlice("@(");
-                while (try self.nextToken()) |et| {
-                    if (et.type == .expr_end) break;
-                    try raw_buf.appendSlice(self.slice(et));
-                }
-                try raw_buf.append(')');
-                continue;
-            }
-            try raw_buf.appendSlice(self.slice(t));
+            try rows.append(cells);
         }
 
-        try parseInlineSpans(self.allocator, raw_buf.items, &para.spans);
-        return para;
+        var headers: ast.Row = &.{};
+        var body_rows: []ast.Row = &.{};
+        if (rows.items.len > 0) {
+            headers = try self.allocator.dupe(ast.Cell, rows.items[0]);
+            if (rows.items.len > 1) body_rows = try self.allocator.dupe(ast.Row, rows.items[1..]);
+        }
+
+        try out.append(.{ .table = .{
+            .headers = headers,
+            .rows = body_rows,
+            .alignments = try alignments.toOwnedSlice(),
+            .widths = try widths.toOwnedSlice(),
+        } });
     }
 
-    fn parseInlineSpans(allocator: std.mem.Allocator, raw: []const u8, spans: *std.array_list.Managed(ast.Span)) !void {
-        var pos: usize = 0;
-        var text_start: usize = 0;
+    /// 对齐行中的列宽：`<2cm`、`^30%`、`>2fr`，无后缀则按自然宽度分配
+    fn parseColumnWidth(_: *Parser, spec: []const u8) ParseError!ast.ColumnWidth {
+        const s = std.mem.trim(u8, spec, " \t");
+        if (s.len == 0) return .{ .auto = {} };
 
-        while (pos < raw.len) {
-            const c = raw[pos];
-
-            // @(expr) — variable expression
-            if (c == '@' and pos + 1 < raw.len and raw[pos + 1] == '(') {
-                if (pos > text_start) {
-                    try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
-                }
-                const expr_start = pos + 2;
-                var depth: u32 = 1;
-                var ep = expr_start;
-                while (ep < raw.len) : (ep += 1) {
-                    if (raw[ep] == '(') depth += 1
-                    else if (raw[ep] == ')') {
-                        depth -= 1;
-                        if (depth == 0) break;
-                    }
-                }
-                try spans.append(.{ .expr = try allocator.dupe(u8, raw[expr_start..ep]) });
-                pos = if (ep < raw.len) ep + 1 else ep;
-                text_start = pos;
-                continue;
-            }
-
-            // *bold*
-            if (c == '*') {
-                if (findClosingMarker(raw, pos + 1, '*')) |end| {
-                    if (end > pos + 1) {
-                        if (pos > text_start) {
-                            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
-                        }
-                        try spans.append(.{ .bold = try allocator.dupe(u8, raw[pos + 1 .. end]) });
-                        pos = end + 1;
-                        text_start = pos;
-                        continue;
-                    }
-                }
-            }
-
-            // `code`
-            if (c == '`') {
-                if (findClosingMarker(raw, pos + 1, '`')) |end| {
-                    if (end > pos + 1) {
-                        if (pos > text_start) {
-                            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
-                        }
-                        try spans.append(.{ .code = try allocator.dupe(u8, raw[pos + 1 .. end]) });
-                        pos = end + 1;
-                        text_start = pos;
-                        continue;
-                    }
-                }
-            }
-
-            // $inline math$
-            if (c == '$') {
-                if (findClosingMarker(raw, pos + 1, '$')) |end| {
-                    if (end > pos + 1) {
-                        if (pos > text_start) {
-                            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
-                        }
-                        try spans.append(.{ .inline_math = try allocator.dupe(u8, raw[pos + 1 .. end]) });
-                        pos = end + 1;
-                        text_start = pos;
-                        continue;
-                    }
-                }
-            }
-
-            // [text](url) — link
-            if (c == '[') {
-                if (findClosingMarker(raw, pos + 1, ']')) |text_end| {
-                    if (text_end + 1 < raw.len and raw[text_end + 1] == '(') {
-                        if (findClosingMarker(raw, text_end + 2, ')')) |url_end| {
-                            if (pos > text_start) {
-                                try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
-                            }
-                            const link_text = try allocator.dupe(u8, raw[pos + 1 .. text_end]);
-                            const link_url = try allocator.dupe(u8, raw[text_end + 2 .. url_end]);
-                            try spans.append(.{ .link = .{ .text = link_text, .url = link_url } });
-                            pos = url_end + 1;
-                            text_start = pos;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            pos += 1;
+        if (std.mem.endsWith(u8, s, "%")) {
+            const n = std.fmt.parseFloat(f64, s[0 .. s.len - 1]) catch return .{ .auto = {} };
+            return .{ .fraction = n / 100.0 };
         }
-
-        if (pos > text_start) {
-            try spans.append(.{ .text = try allocator.dupe(u8, raw[text_start..pos]) });
+        if (std.mem.endsWith(u8, s, "fr")) {
+            const n = std.fmt.parseFloat(f64, s[0 .. s.len - 2]) catch return .{ .auto = {} };
+            return .{ .fr = n };
         }
+        // 纯数字按 Typst 的 fr 处理；带单位则是绝对长度
+        var i: usize = 0;
+        while (i < s.len and (std.ascii.isDigit(s[i]) or s[i] == '.')) i += 1;
+        if (i == s.len) {
+            const n = std.fmt.parseFloat(f64, s) catch return .{ .auto = {} };
+            return .{ .fr = n };
+        }
+        const len = unitsLength(s) orelse return .{ .auto = {} };
+        return .{ .length = len };
     }
 
-    fn findClosingMarker(text: []const u8, start: usize, marker: u8) ?usize {
-        var i = start;
-        while (i < text.len) : (i += 1) {
-            if (text[i] == '\\' and i + 1 < text.len) {
+    fn parseTableRow(self: *Parser, raw: []const u8) ParseError!ast.Row {
+        var cells = std.array_list.Managed(ast.Cell).init(self.allocator);
+        var rest = raw;
+        if (rest[0] == '|') rest = rest[1..];
+        if (rest.len > 0 and rest[rest.len - 1] == '|') rest = rest[0 .. rest.len - 1];
+        var iter = std.mem.splitScalar(u8, rest, '|');
+        while (iter.next()) |cell| {
+            try cells.append(try self.parseInline(std.mem.trim(u8, cell, " \t")));
+        }
+        return try cells.toOwnedSlice();
+    }
+
+    fn parseSemanticBlock(self: *Parser, header: []const u8, out: *std.array_list.Managed(ast.Block)) !void {
+        var name = header;
+        var language: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, header, ' ')) |sp| {
+            name = std.mem.trim(u8, header[0..sp], " \t");
+            language = std.mem.trim(u8, header[sp + 1 ..], " \t");
+        }
+
+        // 属性行只在存在 `---` 分隔符时才生效；没有分隔符时整段都是正文
+        var attr_lines = std.array_list.Managed(lexer.Line).init(self.allocator);
+        while (self.lexer.peek()) |line| {
+            if (line.blank or std.mem.eql(u8, line.text, "---")) break;
+            try attr_lines.append(line);
+            _ = self.lexer.next();
+        }
+
+        var attrs = std.StringHashMap([]const u8).init(self.allocator);
+        var body: []lexer.Line = &.{};
+        if (self.lexer.peek()) |line| {
+            if (std.mem.eql(u8, line.text, "---")) {
+                _ = self.lexer.next();
+                for (attr_lines.items) |attr| {
+                    const sep = std.mem.indexOfScalar(u8, attr.text, ':') orelse continue;
+                    try attrs.put(attr.text[0..sep], attr.text[sep + 1 ..]);
+                }
+                body = try self.lexer.collectUntilBlank();
+            } else {
+                body = attr_lines.items;
+            }
+        } else {
+            body = attr_lines.items;
+        }
+
+        const id = attrs.get("id");
+        const caption = attrs.get("caption");
+
+        if (std.mem.eql(u8, name, "code")) {
+            var source = std.array_list.Managed(u8).init(self.allocator);
+            for (body, 0..) |l, i| {
+                if (i > 0) try source.append('\n');
+                try source.appendSlice(l.text);
+            }
+            try out.append(.{ .code = .{
+                .language = language,
+                .caption = caption,
+                .id = id,
+                .source = try source.toOwnedSlice(),
+            } });
+            return;
+        }
+
+        if (std.mem.eql(u8, name, "math")) {
+            var source = std.array_list.Managed(u8).init(self.allocator);
+            for (body, 0..) |l, i| {
+                if (i > 0) try source.append(' ');
+                try source.appendSlice(l.text);
+            }
+            try self.appendMathBlock(try source.toOwnedSlice(), out, id, caption);
+            return;
+        }
+
+        if (std.mem.eql(u8, name, "figure")) {
+            var width: ?f64 = null;
+            if (attrs.get("width")) |w| width = unitsLength(w);
+            try out.append(.{ .figure = .{
+                .src = attrs.get("src"),
+                .alt = attrs.get("alt"),
+                .caption = caption,
+                .id = id,
+                .width = width,
+            } });
+            return;
+        }
+
+        if (std.mem.eql(u8, name, "quote")) {
+            try out.append(.{ .quote = .{
+                .content = try self.parseBodyBlocks(body),
+                .source = attrs.get("source"),
+                .caption = caption,
+                .id = id,
+            } });
+            return;
+        }
+
+        if (std.mem.eql(u8, name, "definitions") or std.mem.eql(u8, name, "definition")) {
+            var entries = std.array_list.Managed(ast.Definition).init(self.allocator);
+            for (body) |l| {
+                const sep = std.mem.indexOfScalar(u8, l.text, ':') orelse continue;
+                try entries.append(.{
+                    .term = try self.parseInline(std.mem.trim(u8, l.text[0..sep], " \t")),
+                    .definition = try self.parseInline(std.mem.trim(u8, l.text[sep + 1 ..], " \t")),
+                });
+            }
+            try out.append(.{ .definition_list = .{ .entries = try entries.toOwnedSlice() } });
+            return;
+        }
+
+        if (std.mem.eql(u8, name, "bibliography") or std.mem.eql(u8, name, "bib")) {
+            var entries = std.array_list.Managed(ast.BibEntry).init(self.allocator);
+            for (body) |l| {
+                if (l.text.len == 0) continue;
+                if (l.text[0] != '[') continue;
+                const close = findClose(l.text, 1, ']') orelse continue;
+                const key = std.mem.trim(u8, l.text[1..close], " \t");
+                if (key.len == 0) continue;
+                try entries.append(.{
+                    .key = try self.allocator.dupe(u8, key),
+                    .id = id,
+                    .text = try self.parseInline(std.mem.trim(u8, l.text[close + 1 ..], " \t")),
+                });
+            }
+            try out.append(.{ .bibliography = .{
+                .entries = try entries.toOwnedSlice(),
+                .title = attrs.get("title"),
+                .id = id,
+            } });
+            return;
+        }
+
+        // 其余名称都是提示框
+        const kind = calloutKind(name);
+        try out.append(.{ .callout = .{
+            .kind = kind,
+            .title = attrs.get("title"),
+            .content = try self.parseBodyBlocks(body),
+            .id = id,
+            .caption = caption,
+        } });
+    }
+
+    /// 语义块内部的内容：已经收集好的行，不再消费词法流
+    fn parseBodyBlocks(self: *Parser, body: []lexer.Line) ParseError![]ast.Block {
+        var out = std.array_list.Managed(ast.Block).init(self.allocator);
+        var i: usize = 0;
+        while (i < body.len) {
+            const line = body[i];
+            if (line.blank) {
                 i += 1;
                 continue;
             }
-            if (text[i] == marker) return i;
-            if (text[i] == '\n') return null;
+            if (isListMarker(line.text)) {
+                var items = std.array_list.Managed(ast.ListItem).init(self.allocator);
+                const ordered = isOrderedMarker(line.text);
+                while (i < body.len and !body[i].blank and isListMarker(body[i].text)) {
+                    try items.append(try self.parseListItem(body[i].text));
+                    i += 1;
+                }
+                try out.append(.{ .list = .{ .items = try items.toOwnedSlice(), .ordered = ordered } });
+                continue;
+            }
+            var group = std.array_list.Managed([]const u8).init(self.allocator);
+            while (i < body.len and !body[i].blank and !isListMarker(body[i].text)) {
+                try group.append(body[i].text);
+                i += 1;
+            }
+            var joined = std.array_list.Managed(u8).init(self.allocator);
+            for (group.items, 0..) |l, k| {
+                if (k > 0) try joined.append(' ');
+                try joined.appendSlice(l);
+            }
+            try self.appendParagraph(try joined.toOwnedSlice(), &out);
         }
-        return null;
+        return out.toOwnedSlice();
     }
 
-    fn parseList(self: *Parser) !ast.List {
-        var list = ast.List.init(self.allocator);
-        errdefer list.deinit(self.allocator);
+    /// 独立公式：Typst 的 $$ ... $$，以及整段只有一个 $...$ 的情况
+    fn appendParagraph(self: *Parser, text: []const u8, out: *std.array_list.Managed(ast.Block)) !void {
+        const start = std.mem.indexOf(u8, text, "$$");
+        if (start == null) {
+            if (text.len >= 2 and text[0] == '$' and text[text.len - 1] == '$' and
+                std.mem.indexOfScalar(u8, text[1 .. text.len - 1], '$') == null)
+            {
+                try self.appendMathBlock(std.mem.trim(u8, text[1 .. text.len - 1], " \t"), out, null, null);
+                return;
+            }
+            try out.append(.{ .paragraph = .{ .content = try self.parseInline(text) } });
+            return;
+        }
+        var i: usize = 0;
+        while (i < text.len) {
+            const at = std.mem.indexOf(u8, text[i..], "$$") orelse {
+                const rest = std.mem.trim(u8, text[i..], " \t");
+                if (rest.len > 0) try out.append(.{ .paragraph = .{ .content = try self.parseInline(rest) } });
+                break;
+            };
+            const before = std.mem.trim(u8, text[i .. i + at], " \t");
+            if (before.len > 0) try out.append(.{ .paragraph = .{ .content = try self.parseInline(before) } });
+            const from = i + at + 2;
+            const end = std.mem.indexOf(u8, text[from..], "$$") orelse {
+                try out.append(.{ .paragraph = .{ .content = try self.parseInline(std.mem.trim(u8, text[i..], " \t")) } });
+                break;
+            };
+            try self.appendMathBlock(std.mem.trim(u8, text[from .. from + end], " \t"), out, null, null);
+            i = from + end + 2;
+        }
+    }
 
-        while (try self.peekToken()) |t| {
-            if (t.type != .list_dash) break;
-            _ = try self.nextToken();
-            try self.skipWhitespace();
+    fn appendMathBlock(self: *Parser, source: []const u8, out: *std.array_list.Managed(ast.Block), id: ?[]const u8, caption: ?[]const u8) !void {
+        var math_parser = math.Parser.init(self.allocator, source);
+        math_parser.setDisplay(true);
+        const nodes = try math_parser.parse();
+        try out.append(.{ .math = .{ .source = source, .nodes = nodes, .id = id, .caption = caption } });
+    }
 
-            var raw_buf = std.array_list.Managed(u8).init(self.allocator);
-            defer raw_buf.deinit();
+    fn parseInclude(self: *Parser, path: []const u8, out: *std.array_list.Managed(ast.Block)) !void {
+        const full = try std.fs.path.join(self.allocator, &.{ self.base_dir, path });
+        const file = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, full, self.allocator, .limited(1 << 20)) catch return ParseError.Parse;
+        var sub = try Parser.init(self.allocator, self.io, file);
+        sub.setBaseDir(std.fs.path.dirname(full) orelse self.base_dir);
+        const doc = sub.parse() catch return ParseError.Parse;
+        for (doc.content) |block| try out.append(block);
+    }
 
-            while (try self.nextToken()) |it| {
-                if (it.type == .newline) {
-                    try self.skipWhitespace();
-                    const pt = try self.peekToken();
-                    if (pt != null and pt.?.type == .list_dash) break;
-                    if (pt != null and (pt.?.type == .heading or pt.?.type == .block_start or
-                        pt.?.type == .script_start or pt.?.type == .directive_start)) break;
-                    if (pt == null) break;
-                    try raw_buf.append(' ');
-                    continue;
-                }
-                if (it.type == .expr_start) {
-                    try raw_buf.appendSlice("@(");
-                    while (try self.nextToken()) |et| {
-                        if (et.type == .expr_end) break;
-                        try raw_buf.appendSlice(self.slice(et));
+    // ---- 行内 ----
+
+    fn parseInline(self: *Parser, text: []const u8) ParseError![]ast.Inline {
+        var out = std.array_list.Managed(ast.Inline).init(self.allocator);
+        var i: usize = 0;
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+
+        while (i < text.len) {
+            const c = text[i];
+            if (c == '\\' and i + 1 < text.len) {
+                try buf.append(text[i + 1]);
+                i += 2;
+                continue;
+            }
+
+            if (c == '*' or c == '_' or c == '`' or c == '$' or c == '^' or c == '~') {
+                const closer = c;
+                const end = findClose(text, i + 1, closer);
+                if (end != null) {
+                    try self.flush(&buf, &out);
+                    const inner = text[i + 1 .. end.?];
+                    switch (closer) {
+                        '*' => try out.append(.{ .strong = try self.parseInline(inner) }),
+                        '_' => try out.append(.{ .em = try self.parseInline(inner) }),
+                        '`' => try out.append(.{ .code = try self.allocator.dupe(u8, inner) }),
+                        '$' => {
+                            var math_parser = math.Parser.init(self.allocator, inner);
+                            try out.append(.{ .math = try math_parser.parse() });
+                        },
+                        '^' => try out.append(.{ .sup = try self.parseInline(inner) }),
+                        else => try out.append(.{ .sub = try self.parseInline(inner) }),
                     }
-                    try raw_buf.append(')');
+                    i = end.? + 1;
                     continue;
                 }
-                try raw_buf.appendSlice(self.slice(it));
             }
 
-            var item = ast.Paragraph.init(self.allocator);
-            try parseInlineSpans(self.allocator, raw_buf.items, &item.spans);
-            try list.items.append(item);
-        }
-
-        return list;
-    }
-
-    fn parseTable(self: *Parser) !ast.Table {
-        var table = ast.Table.init(self.allocator);
-        errdefer table.deinit(self.allocator);
-
-        // 解析表头行
-        _ = try self.nextToken(); // 第一个 |
-        try self.skipWhitespace();
-        while (try self.nextToken()) |t| {
-            if (t.type == .newline) break;
-            if (t.type == .identifier or t.type == .literal) {
-                try table.headers.append(try self.allocator.dupe(u8, self.slice(t)));
-            }
-            if (t.type == .table_pipe) {}
-        }
-
-        // 分隔行 | < | ^ | > |
-        try self.skipWhitespace();
-        while (try self.nextToken()) |t| {
-            if (t.type == .newline) break;
-            if (t.type == .literal) {
-                const s = self.slice(t);
-                if (std.mem.eql(u8, s, "<")) try table.alignments.append(.left)
-                else if (std.mem.eql(u8, s, "^")) try table.alignments.append(.center)
-                else if (std.mem.eql(u8, s, ">")) try table.alignments.append(.right);
-            }
-        }
-
-        // 数据行
-        try self.skipWhitespace();
-        while (try self.peekToken()) |t| {
-            if (t.type != .table_pipe) break;
-            _ = try self.nextToken();
-            var row = std.array_list.Managed([]const u8).init(self.allocator);
-            while (try self.nextToken()) |rt| {
-                if (rt.type == .newline) break;
-                if (rt.type == .identifier or rt.type == .literal) {
-                    try row.append(try self.allocator.dupe(u8, self.slice(rt)));
+            if (c == '[') {
+                const close = findClose(text, i + 1, ']');
+                if (close != null and i + 1 < close.?) {
+                    const label = text[i + 1 .. close.?];
+                    const after = close.? + 1;
+                    if (after < text.len and text[after] == '(') {
+                        const paren = findClose(text, after + 1, ')');
+                        if (paren != null) {
+                            try self.flush(&buf, &out);
+                            try out.append(.{ .link = .{
+                                .text = try self.parseInline(label),
+                                .url = try self.allocator.dupe(u8, text[after + 1 .. paren.?]),
+                            } });
+                            i = paren.? + 1;
+                            continue;
+                        }
+                    }
+                    if (label[0] == '-' and label.len > 1 and label[1] == '>') {
+                        try self.flush(&buf, &out);
+                        try out.append(.{ .ref = try self.allocator.dupe(u8, std.mem.trim(u8, label[2..], " \t")) });
+                        i = close.? + 1;
+                        continue;
+                    }
+                    if (label[0] == '^') {
+                        try self.flush(&buf, &out);
+                        try out.append(.{ .footnote = try self.parseInline(label[1..]) });
+                        i = close.? + 1;
+                        continue;
+                    }
+                    if (label[0] == '@' and label.len > 1) {
+                        try self.flush(&buf, &out);
+                        try out.append(.{ .cite = try self.allocator.dupe(u8, std.mem.trim(u8, label[1..], " \t")) });
+                        i = close.? + 1;
+                        continue;
+                    }
                 }
             }
-            if (row.items.len > 0) try table.rows.append(row);
-        }
 
-        return table;
+            if (c == '@' and i + 1 < text.len and text[i + 1] == '(') {
+                const close = findClose(text, i + 2, ')');
+                if (close != null) {
+                    try self.flush(&buf, &out);
+                    try out.append(.{ .expr = try self.allocator.dupe(u8, text[i + 2 .. close.?]) });
+                    i = close.? + 1;
+                    continue;
+                }
+            }
+
+            try buf.append(c);
+            i += 1;
+        }
+        try self.flush(&buf, &out);
+        return out.toOwnedSlice();
+    }
+
+    fn flush(self: *Parser, buf: *std.array_list.Managed(u8), out: *std.array_list.Managed(ast.Inline)) !void {
+        if (buf.items.len == 0) return;
+        const raw = try buf.toOwnedSlice();
+        if (self.smart.quotes or self.smart.dashes or self.smart.ellipsis or self.smart.symbols) {
+            var out_buf = std.array_list.Managed(u8).init(self.allocator);
+            try typography.append(&out_buf, raw, self.smart, &self.state);
+            try out.append(.{ .text = try out_buf.toOwnedSlice() });
+        } else {
+            try out.append(.{ .text = raw });
+        }
     }
 };
+
+fn findClose(text: []const u8, from: usize, closer: u8) ?usize {
+    var i = from;
+    while (i < text.len) {
+        if (text[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (text[i] == closer) return i;
+        i += 1;
+    }
+    return null;
+}
+
+fn calloutKind(name: []const u8) ast.CalloutKind {
+    if (std.mem.eql(u8, name, "warning")) return .warning;
+    if (std.mem.eql(u8, name, "tip")) return .tip;
+    if (std.mem.eql(u8, name, "caution")) return .caution;
+    if (std.mem.eql(u8, name, "important")) return .important;
+    return .note;
+}
+
+fn unitsLength(value: []const u8) ?f64 {
+    const units = @import("units.zig");
+    return units.parseLength(value, units.pt);
+}
