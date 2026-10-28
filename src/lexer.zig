@@ -1,240 +1,129 @@
-//! Ztype 词法分析器
-//! 将 .zt 源文件解析为 Token 流
+//! Ztype 行法分析器
+//! 把源码切成"逻辑行"：去注释、去空行、保留缩进，供语法解析器分类。
+//! Ztype 的语法以行为单位（标题、列表、表格、语义块都以行首标记开始），
+//! 因此行法分析器比字符级 Token 流更贴合语言本身。
 
 const std = @import("std");
-const Token = @import("ast.zig").Token;
-const TokenType = @import("ast.zig").TokenType;
+
+pub const Line = struct {
+    /// 1 起始的行号
+    number: usize,
+    /// 去掉注释后的内容
+    text: []const u8,
+    /// 行首缩进（空格数）
+    indent: usize,
+    /// 是否为空行（逻辑分段）
+    blank: bool,
+};
 
 pub const Lexer = struct {
-    source: []const u8,
-    pos: usize = 0,
-    line: usize = 1,
-    column: usize = 1,
-    in_metadata: bool = false,
     allocator: std.mem.Allocator,
+    lines: []Line,
+    index: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, source: []const u8) Lexer {
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Lexer {
         return .{
-            .source = source,
             .allocator = allocator,
+            .lines = try splitLines(allocator, source),
         };
     }
 
-    fn peek(self: *Lexer) ?u8 {
-        if (self.pos >= self.source.len) return null;
-        return self.source[self.pos];
+    pub fn reset(self: *Lexer) void {
+        self.index = 0;
     }
 
-    fn peekN(self: *Lexer, n: usize) ?u8 {
-        if (self.pos + n >= self.source.len) return null;
-        return self.source[self.pos + n];
+    pub fn next(self: *Lexer) ?Line {
+        if (self.index >= self.lines.len) return null;
+        const line = self.lines[self.index];
+        self.index += 1;
+        return line;
     }
 
-    fn advance(self: *Lexer) ?u8 {
-        if (self.pos >= self.source.len) return null;
-        const c = self.source[self.pos];
-        self.pos += 1;
-        if (c == '\n') {
-            self.line += 1;
-            self.column = 1;
-        } else {
-            self.column += 1;
-        }
-        return c;
+    pub fn peek(self: *Lexer) ?Line {
+        if (self.index >= self.lines.len) return null;
+        return self.lines[self.index];
     }
 
-    fn isLineStart(self: *Lexer) bool {
-        return self.column == 1 or (self.pos > 0 and self.source[self.pos - 1] == '\n');
+    pub fn done(self: *const Lexer) bool {
+        return self.index >= self.lines.len;
     }
 
-    pub fn next(self: *Lexer) !?Token {
-        const start_pos = self.pos;
-        const start_line = self.line;
-        const start_col = self.column;
-
-        const c = self.peek() orelse return null;
-
-        // 空白
-        if (std.ascii.isWhitespace(c)) {
-            var has_newline = false;
-            while (self.peek()) |ch| {
-                if (!std.ascii.isWhitespace(ch)) break;
-                if (ch == '\n') has_newline = true;
-                _ = self.advance();
-            }
-            return Token{
-                .type = if (has_newline) .newline else .space,
-                .start = start_pos,
-                .end = self.pos,
-                .line = start_line,
-                .column = start_col,
-            };
+    /// 读取到下一个空行之前的所有行（用于语义块、段落）
+    pub fn collectUntilBlank(self: *Lexer) ![]Line {
+        var out = std.array_list.Managed(Line).init(self.allocator);
+        while (self.next()) |line| {
+            if (line.blank) break;
+            try out.append(line);
         }
-
-        // 行首检测
-        const at_line_start = self.pos == 0 or self.source[self.pos - 1] == '\n';
-
-        if (at_line_start) {
-            // 元数据分隔符 --- (根据状态区分 start/end)
-            if (c == '-' and self.peekN(1) == '-' and self.peekN(2) == '-') {
-                _ = self.advance();
-                _ = self.advance();
-                _ = self.advance();
-                const tok_type: TokenType = if (self.in_metadata) .meta_end else .meta_start;
-                self.in_metadata = !self.in_metadata;
-                return Token{ .type = tok_type, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-
-            // 标题 =
-            if (c == '=') {
-                var level: u8 = 0;
-                while (self.peek() == '=') {
-                    _ = self.advance();
-                    level += 1;
-                }
-                return Token{
-                    .type = .heading,
-                    .start = start_pos,
-                    .end = self.pos,
-                    .line = start_line,
-                    .column = start_col,
-                    .extra = .{ .heading_level = @min(level, 4) },
-                };
-            }
-
-            // 脚本块 @{
-            if (c == '@' and self.peekN(1) == '{') {
-                _ = self.advance();
-                _ = self.advance();
-                return Token{ .type = .script_start, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-
-            // 语义块 ::
-            if (c == ':' and self.peekN(1) == ':') {
-                _ = self.advance();
-                _ = self.advance();
-                return Token{ .type = .block_start, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-
-            // 页面指令 %%
-            if (c == '%' and self.peekN(1) == '%') {
-                _ = self.advance();
-                _ = self.advance();
-                return Token{ .type = .directive_start, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-
-            // 注释 ;
-            if (c == ';') {
-                _ = self.advance();
-                if (self.peek() == '{') {
-                    _ = self.advance();
-                    return Token{ .type = .comment_block_start, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-                }
-                return Token{ .type = .comment_start, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-
-            // 表格行 |
-            if (c == '|') {
-                _ = self.advance();
-                return Token{ .type = .table_pipe, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-
-            // 列表项 -
-            if (c == '-') {
-                _ = self.advance();
-                return Token{ .type = .list_dash, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-        }
-
-        // 脚本块结束 }（仅当 } 位于行首，即前一个非空格/制表符为换行）
-        if (c == '}' and self.pos > 0) {
-            var i: usize = self.pos;
-            while (i > 0) {
-                const prev = self.source[i - 1];
-                if (prev == ' ' or prev == '\t') i -= 1
-                else break;
-            }
-            if (i > 0 and self.source[i - 1] == '\n') {
-                _ = self.advance();
-                return Token{ .type = .script_end, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-            }
-        }
-
-        // 注释块结束 };
-        if (c == ';' and self.peekN(1) == '}') {
-            _ = self.advance();
-            _ = self.advance();
-            return Token{ .type = .comment_block_end, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 行内表达式 @(
-        if (c == '@' and self.peekN(1) == '(') {
-            _ = self.advance();
-            _ = self.advance();
-            return Token{ .type = .expr_start, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 表达式结束 )
-        if (c == ')') {
-            _ = self.advance();
-            return Token{ .type = .expr_end, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 字符串 "..."
-        if (c == '"') {
-            _ = self.advance();
-            while (self.peek()) |ch| {
-                if (ch == '\\') {
-                    _ = self.advance();
-                    _ = self.advance();
-                    continue;
-                }
-                if (ch == '"') break;
-                _ = self.advance();
-            }
-            if (self.peek() == '"') _ = self.advance();
-            return Token{ .type = .string, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 标识符或关键字
-        if (std.ascii.isAlphanumeric(c) or c == '_') {
-            while (self.peek()) |ch| {
-                if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-' and ch != '.') break;
-                _ = self.advance();
-            }
-            return Token{ .type = .identifier, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 冒号 :
-        if (c == ':') {
-            _ = self.advance();
-            return Token{ .type = .colon, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 分隔符 --- (块内容分隔)
-        if (c == '-' and self.peekN(1) == '-' and self.peekN(2) == '-') {
-            _ = self.advance();
-            _ = self.advance();
-            _ = self.advance();
-            return Token{ .type = .block_separator, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-        }
-
-        // 其他字符作为字面量
-        _ = self.advance();
-        return Token{ .type = .literal, .start = start_pos, .end = self.pos, .line = start_line, .column = start_col };
-    }
-
-    pub fn slice(self: *Lexer, token: Token) []const u8 {
-        return self.source[token.start..token.end];
-    }
-
-    pub fn getAllTokens(self: *Lexer) ![]Token {
-        var tokens = std.array_list.Managed(Token).init(self.allocator);
-        errdefer tokens.deinit();
-
-        while (try self.next()) |token| {
-            try tokens.append(token);
-        }
-        return tokens.toOwnedSlice();
+        return out.toOwnedSlice();
     }
 };
+
+fn splitLines(allocator: std.mem.Allocator, source: []const u8) ![]Line {
+    var out = std.array_list.Managed(Line).init(allocator);
+
+    // 先剥离 ;{ ... } 块注释
+    const cleaned = try stripBlockComments(allocator, source);
+
+    var number: usize = 1;
+    var rest = cleaned;
+    while (true) {
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const raw = if (nl) |i| rest[0..i] else rest;
+        const text = stripLineComment(raw);
+        const indent = countIndent(raw);
+        try out.append(.{
+            .number = number,
+            .text = try allocator.dupe(u8, text),
+            .indent = indent,
+            .blank = text.len == 0,
+        });
+        if (nl == null) break;
+        rest = rest[nl.? + 1 ..];
+        number += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+fn stripBlockComments(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    var i: usize = 0;
+    while (i < source.len) {
+        if (source[i] == ';' and i + 1 < source.len and source[i + 1] == '{') {
+            var depth: usize = 1;
+            i += 2;
+            while (i < source.len and depth > 0) {
+                if (source[i] == '{') depth += 1 else if (source[i] == '}') depth -= 1;
+                i += 1;
+            }
+            continue;
+        }
+        try out.append(source[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+/// 行首的 `;` 视为注释；行中的 `;` 只有紧跟空白时才视为注释
+fn countIndent(raw: []const u8) usize {
+    var n: usize = 0;
+    for (raw) |c| {
+        if (c == ' ') n += 1 else if (c == '\t') n += 4 else break;
+    }
+    return n;
+}
+
+
+fn stripLineComment(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r");
+    if (trimmed.len == 0) return trimmed;
+    if (trimmed[0] == ';') return "";
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        if (trimmed[i] == ';' and (i == 0 or std.ascii.isWhitespace(trimmed[i - 1]))) {
+            return std.mem.trim(u8, trimmed[0..i], " \t\r");
+        }
+        i += 1;
+    }
+    return trimmed;
+}
