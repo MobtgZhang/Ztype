@@ -1,1048 +1,710 @@
-//! Ztype PDF 渲染器
-//! 生成 PDF 1.4 文档，支持多页、文本自动换行、CJK 字体、页码
+//! Ztype PDF 后端
+//! 消费排版引擎的分页结果，生成 PDF 1.7 文档：
+//!   - 多页、base-14 标准字体、Symbol 数学字体、Type0 CJK 字体
+//!   - 书签大纲、内部/外部链接注释、JPEG 图片嵌入
 //!
-//! PDF 对象布局:
-//!   1: Catalog
-//!   2: Pages (parent)
-//!   3: Font Helvetica (F1)
-//!   4: Font Helvetica-Bold (F2)
-//!   5: Font Helvetica-Oblique (F3)
-//!   6: Font Courier (F4) — monospace
-//!   7: CJK CIDFont Type0 (F5)
-//!   8: CIDFont descendant
-//!   9: ToUnicode CMap
-//!   10+: Page objects and content streams
+//! 固定对象编号：1 Catalog、2 Pages、3 Outlines、4 Info、5-14 字体、
+//! 15-24 字体描述符（24 为 CJK）、25 CIDFont；其余为页面、内容流、注释与图片。
 
 const std = @import("std");
-const ast = @import("../ast.zig");
-const cjk = @import("../util/cjk.zig");
-const layout_mod = @import("../util/layout.zig");
-const Resolver = @import("../resolver.zig").Resolver;
+const engine = @import("../engine.zig");
+const fonts = @import("../fonts.zig");
+const style = @import("../style.zig");
+const metrics = @import("../fontmetrics.zig");
 
-const FONT_HELVETICA = "/F1";
-const FONT_HELVETICA_BOLD = "/F2";
-const FONT_HELVETICA_OBLIQUE = "/F3";
-const FONT_COURIER = "/F4";
-const FONT_CJK = "/F5";
+const Allocator = std.mem.Allocator;
 
-const FIXED_OBJ_COUNT = 9;
+fn appendPrint(list: *std.array_list.Managed(u8), comptime fmt: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(list.allocator, fmt, args);
+    try list.appendSlice(s);
+}
 
-const PdfObj = struct {
-    offset: usize = 0,
-    data: []const u8,
+
+const CATALOG_ID: usize = 1;
+const PAGES_ID: usize = 2;
+const OUTLINE_ID: usize = 3;
+const INFO_ID: usize = 4;
+const FONT_BASE: usize = 5;
+const DESC_BASE: usize = 15;
+const CJK_DESC_ID: usize = 24;
+const CIDFONT_ID: usize = 25;
+
+const FontInfo = struct {
+    base_font: []const u8,
+    ascent: f64,
+    descent: f64,
+    flags: i32,
+    bbox: [4]f64,
+    italic: f64,
+    stem_v: f64,
 };
 
-/// Main PDF generation context — accumulates pages and serializes to PDF 1.4
-const PdfBuilder = struct {
-    allocator: std.mem.Allocator,
-    pg: layout_mod.PageLayout,
-    objects: std.array_list.Managed(PdfObj),
-    page_ids: std.array_list.Managed(usize),
-    current_content: std.array_list.Managed(u8),
+const font_infos = [10]FontInfo{
+    .{ .base_font = "Helvetica", .ascent = 718, .descent = -207, .flags = 32, .bbox = .{ -166, -211, 1000, 942 }, .italic = 0, .stem_v = 88 },
+    .{ .base_font = "Helvetica-Bold", .ascent = 718, .descent = -207, .flags = 32, .bbox = .{ -166, -250, 1000, 921 }, .italic = 0, .stem_v = 136 },
+    .{ .base_font = "Helvetica-Oblique", .ascent = 718, .descent = -207, .flags = 32, .bbox = .{ -170, -211, 1132, 942 }, .italic = -12, .stem_v = 88 },
+    .{ .base_font = "Times-Roman", .ascent = 683, .descent = -217, .flags = 32, .bbox = .{ -169, -211, 1010, 942 }, .italic = 0, .stem_v = 83 },
+    .{ .base_font = "Times-Bold", .ascent = 683, .descent = -217, .flags = 32, .bbox = .{ -169, -225, 1012, 938 }, .italic = 0, .stem_v = 136 },
+    .{ .base_font = "Times-Italic", .ascent = 683, .descent = -217, .flags = 32, .bbox = .{ -169, -211, 1010, 942 }, .italic = -11, .stem_v = 76 },
+    .{ .base_font = "Courier", .ascent = 629, .descent = -157, .flags = 32, .bbox = .{ -471, -211, 1204, 942 }, .italic = 0, .stem_v = 105 },
+    .{ .base_font = "Courier-Bold", .ascent = 629, .descent = -157, .flags = 32, .bbox = .{ -471, -211, 1204, 942 }, .italic = 0, .stem_v = 130 },
+    .{ .base_font = "Symbol", .ascent = 698, .descent = -197, .flags = 4, .bbox = .{ -169, -211, 1010, 942 }, .italic = 0, .stem_v = 83 },
+    .{ .base_font = "STSong-Light", .ascent = 880, .descent = -120, .flags = 4, .bbox = .{ -100, -200, 1000, 900 }, .italic = 0, .stem_v = 90 },
+};
+
+const PageLink = struct {
+    x: f64,
     y: f64,
-    page_count: usize,
-
-    fn init(allocator: std.mem.Allocator, pg: layout_mod.PageLayout) PdfBuilder {
-        return .{
-            .allocator = allocator,
-            .pg = pg,
-            .objects = std.array_list.Managed(PdfObj).init(allocator),
-            .page_ids = std.array_list.Managed(usize).init(allocator),
-            .current_content = std.array_list.Managed(u8).init(allocator),
-            .y = pg.paper_h - pg.margin_top,
-            .page_count = 0,
-        };
-    }
-
-    fn deinit(self: *PdfBuilder) void {
-        for (self.objects.items) |obj| self.allocator.free(obj.data);
-        self.objects.deinit();
-        self.page_ids.deinit();
-        self.current_content.deinit();
-    }
-
-    fn contentWidth(self: *const PdfBuilder) f64 {
-        return self.pg.paper_w - self.pg.margin_left - self.pg.margin_right;
-    }
-
-    fn bottomLimit(self: *const PdfBuilder) f64 {
-        return self.pg.margin_bottom + 30;
-    }
-
-    fn startPage(self: *PdfBuilder) !void {
-        self.page_count += 1;
-        self.y = self.pg.paper_h - self.pg.margin_top;
-        self.current_content.clearRetainingCapacity();
-
-        if (self.pg.header_left != null or self.pg.header_center != null or self.pg.header_right != null) {
-            const header_y = self.pg.paper_h - self.pg.margin_top + 15;
-            try self.current_content.appendSlice("BT\n");
-            if (self.pg.header_left) |s| {
-                try self.setFont(FONT_HELVETICA, 9);
-                try self.moveTo(self.pg.margin_left, header_y);
-                try self.showText(s);
-            }
-            if (self.pg.header_center) |s| {
-                try self.setFont(FONT_HELVETICA, 9);
-                const tw = cjk.measureTextWidth(s, 9);
-                try self.moveTo(self.pg.margin_left + (self.contentWidth() - tw) / 2, header_y);
-                try self.showText(s);
-            }
-            if (self.pg.header_right) |s| {
-                try self.setFont(FONT_HELVETICA, 9);
-                const tw = cjk.measureTextWidth(s, 9);
-                try self.moveTo(self.pg.paper_w - self.pg.margin_right - tw, header_y);
-                try self.showText(s);
-            }
-            try self.current_content.appendSlice("ET\n");
-        }
-    }
-
-    fn endPage(self: *PdfBuilder) !void {
-        // Footer with page number
-        const footer_y = self.pg.margin_bottom - 15;
-        try self.current_content.appendSlice("BT\n");
-
-        if (self.pg.footer_left) |s| {
-            try self.setFont(FONT_HELVETICA, 9);
-            try self.moveTo(self.pg.margin_left, footer_y);
-            try self.showText(s);
-        }
-        if (self.pg.footer_center) |s| {
-            try self.setFont(FONT_HELVETICA, 9);
-            const tw = cjk.measureTextWidth(s, 9);
-            try self.moveTo(self.pg.margin_left + (self.contentWidth() - tw) / 2, footer_y);
-            try self.showText(s);
-        }
-        if (self.pg.footer_right) |s| {
-            try self.setFont(FONT_HELVETICA, 9);
-            const tw = cjk.measureTextWidth(s, 9);
-            try self.moveTo(self.pg.paper_w - self.pg.margin_right - tw, footer_y);
-            try self.showText(s);
-        }
-
-        // Always show page number if no footer_center
-        if (self.pg.footer_center == null) {
-            try self.setFont(FONT_HELVETICA, 9);
-            var num_buf: [16]u8 = undefined;
-            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{self.page_count}) catch "?";
-            const tw = cjk.measureTextWidth(num_str, 9);
-            try self.moveTo(self.pg.margin_left + (self.contentWidth() - tw) / 2, footer_y);
-            try self.showTextAscii(num_str);
-        }
-
-        try self.current_content.appendSlice("ET\n");
-
-        // Horizontal rule above footer
-        try self.current_content.writer().print("0.8 G\n{d:.1} {d:.1} m {d:.1} {d:.1} l S\n0 G\n", .{
-            self.pg.margin_left,
-            self.pg.margin_bottom,
-            self.pg.paper_w - self.pg.margin_right,
-            self.pg.margin_bottom,
-        });
-
-        const content_data = try self.allocator.dupe(u8, self.current_content.items);
-        const stream_id = FIXED_OBJ_COUNT + self.page_ids.items.len * 2 + 2;
-        const page_id = stream_id - 1;
-
-        var page_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer page_buf.deinit();
-        try page_buf.writer().print(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {d:.0} {d:.0}] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R /F5 7 0 R >> >> /Contents {d} 0 R >>",
-            .{ self.pg.paper_w, self.pg.paper_h, stream_id },
-        );
-
-        try self.objects.append(.{ .data = try page_buf.toOwnedSlice() });
-
-        var stream_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer stream_buf.deinit();
-        try stream_buf.writer().print("<< /Length {d} >>\nstream\n", .{content_data.len});
-        try stream_buf.appendSlice(content_data);
-        self.allocator.free(content_data);
-        try stream_buf.appendSlice("\nendstream");
-
-        try self.objects.append(.{ .data = try stream_buf.toOwnedSlice() });
-        try self.page_ids.append(page_id);
-    }
-
-    fn checkPageBreak(self: *PdfBuilder, needed: f64) !void {
-        if (self.y - needed < self.bottomLimit()) {
-            try self.endPage();
-            try self.startPage();
-        }
-    }
-
-    fn setFont(self: *PdfBuilder, font: []const u8, size: f64) !void {
-        try self.current_content.writer().print("{s} {d:.0} Tf\n", .{ font, size });
-    }
-
-    fn moveTo(self: *PdfBuilder, x: f64, y: f64) !void {
-        try self.current_content.writer().print("{d:.2} {d:.2} Td\n", .{ x, y });
-    }
-
-    fn showText(self: *PdfBuilder, s: []const u8) !void {
-        if (cjk.hasNonAscii(s)) {
-            const encoded = try cjk.utf8ToPdfHex(self.allocator, s);
-            defer self.allocator.free(encoded);
-            try self.current_content.appendSlice(encoded);
-        } else {
-            try self.current_content.append('(');
-            for (s) |c| {
-                switch (c) {
-                    '\\' => try self.current_content.appendSlice("\\\\"),
-                    '(' => try self.current_content.appendSlice("\\("),
-                    ')' => try self.current_content.appendSlice("\\)"),
-                    else => try self.current_content.append(c),
-                }
-            }
-            try self.current_content.append(')');
-        }
-        try self.current_content.appendSlice(" Tj\n");
-    }
-
-    fn showTextAscii(self: *PdfBuilder, s: []const u8) !void {
-        try self.current_content.append('(');
-        for (s) |c| {
-            switch (c) {
-                '\\' => try self.current_content.appendSlice("\\\\"),
-                '(' => try self.current_content.appendSlice("\\("),
-                ')' => try self.current_content.appendSlice("\\)"),
-                else => try self.current_content.append(c),
-            }
-        }
-        try self.current_content.appendSlice(") Tj\n");
-    }
-
-    /// Write a line of text, handling font switching between Latin and CJK
-    fn writeLineSegments(self: *PdfBuilder, text: []const u8, font_size: f64, bold: bool) !void {
-        const segments = try cjk.splitTextSegments(self.allocator, text);
-        defer {
-            for (segments) |seg| self.allocator.free(seg.text);
-            self.allocator.free(segments);
-        }
-        for (segments) |seg| {
-            if (seg.is_cjk) {
-                try self.setFont(FONT_CJK, font_size);
-            } else {
-                const f = if (bold) FONT_HELVETICA_BOLD else FONT_HELVETICA;
-                try self.setFont(f, font_size);
-            }
-            try self.showText(seg.text);
-        }
-    }
-
-    /// Wrap a text string into multiple lines that fit within content width.
-    /// Returns an array of line strings. Caller owns the returned memory.
-    fn wrapText(self: *PdfBuilder, text: []const u8, font_size: f64) ![][]const u8 {
-        var lines = std.array_list.Managed([]const u8).init(self.allocator);
-        errdefer {
-            for (lines.items) |line| self.allocator.free(line);
-            lines.deinit();
-        }
-
-        const max_width = self.contentWidth();
-        var line_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer line_buf.deinit();
-        var current_width: f64 = 0;
-
-        var view = std.unicode.Utf8View.init(text) catch {
-            try lines.append(try self.allocator.dupe(u8, text));
-            return lines.toOwnedSlice();
-        };
-        var iter = view.iterator();
-        var prev_i = iter.i;
-
-        while (iter.nextCodepoint()) |cp| {
-            const cur_i = iter.i;
-            const char_bytes = text[prev_i..cur_i];
-            const cw = cjk.charWidthPt(cp, font_size);
-
-            if (cp == '\n') {
-                try lines.append(try self.allocator.dupe(u8, line_buf.items));
-                line_buf.clearRetainingCapacity();
-                current_width = 0;
-                prev_i = cur_i;
-                continue;
-            }
-
-            if (current_width + cw > max_width and line_buf.items.len > 0) {
-                // For Latin text, try to break at the last space
-                if (!cjk.isCjk(cp)) {
-                    if (std.mem.lastIndexOfScalar(u8, line_buf.items, ' ')) |space_pos| {
-                        if (space_pos > 0) {
-                            const before_space = try self.allocator.dupe(u8, line_buf.items[0..space_pos]);
-                            try lines.append(before_space);
-                            const after_space = line_buf.items[space_pos + 1 ..];
-                            const remaining = try self.allocator.dupe(u8, after_space);
-                            line_buf.clearRetainingCapacity();
-                            try line_buf.appendSlice(remaining);
-                            self.allocator.free(remaining);
-                            current_width = cjk.measureTextWidth(line_buf.items, font_size);
-                            try line_buf.appendSlice(char_bytes);
-                            current_width += cw;
-                            prev_i = cur_i;
-                            continue;
-                        }
-                    }
-                }
-                try lines.append(try self.allocator.dupe(u8, line_buf.items));
-                line_buf.clearRetainingCapacity();
-                current_width = 0;
-            }
-
-            try line_buf.appendSlice(char_bytes);
-            current_width += cw;
-            prev_i = cur_i;
-        }
-
-        if (line_buf.items.len > 0) {
-            try lines.append(try self.allocator.dupe(u8, line_buf.items));
-        }
-
-        return lines.toOwnedSlice();
-    }
-
-    /// Draw a horizontal rule
-    fn drawHRule(self: *PdfBuilder) !void {
-        try self.current_content.writer().print("0.7 G\n{d:.1} {d:.1} m {d:.1} {d:.1} l S\n0 G\n", .{
-            self.pg.margin_left,
-            self.y,
-            self.pg.paper_w - self.pg.margin_right,
-            self.y,
-        });
-        self.y -= 10;
-    }
-
-    /// Draw a filled rectangle (for code block backgrounds, etc.)
-    fn drawRect(self: *PdfBuilder, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64) !void {
-        try self.current_content.writer().print("{d:.3} {d:.3} {d:.3} rg\n{d:.1} {d:.1} {d:.1} {d:.1} re f\n0 0 0 rg\n", .{ r, g, b, x, y, w, h });
-    }
-
-    fn finalize(self: *PdfBuilder, writer: anytype) !void {
-        if (self.page_count > 0) {
-            try self.endPage();
-        }
-
-        var pdf = std.array_list.Managed(u8).init(self.allocator);
-        defer pdf.deinit();
-
-        try pdf.appendSlice("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n\n");
-
-        const total_objects = FIXED_OBJ_COUNT + self.objects.items.len;
-        var offsets = try self.allocator.alloc(usize, total_objects + 1);
-        defer self.allocator.free(offsets);
-
-        // Object 1: Catalog
-        offsets[1] = pdf.items.len;
-        try pdf.appendSlice("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\n");
-
-        // Object 2: Pages
-        offsets[2] = pdf.items.len;
-        try pdf.appendSlice("2 0 obj\n<< /Type /Pages /Kids [");
-        for (self.page_ids.items, 0..) |pid, i| {
-            if (i > 0) try pdf.append(' ');
-            try pdf.writer().print("{d} 0 R", .{pid});
-        }
-        try pdf.writer().print("] /Count {d} >>\nendobj\n\n", .{self.page_ids.items.len});
-
-        // Object 3: Helvetica
-        offsets[3] = pdf.items.len;
-        try pdf.appendSlice("3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n\n");
-
-        // Object 4: Helvetica-Bold
-        offsets[4] = pdf.items.len;
-        try pdf.appendSlice("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>\nendobj\n\n");
-
-        // Object 5: Helvetica-Oblique
-        offsets[5] = pdf.items.len;
-        try pdf.appendSlice("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>\nendobj\n\n");
-
-        // Object 6: Courier (monospace)
-        offsets[6] = pdf.items.len;
-        try pdf.appendSlice("6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>\nendobj\n\n");
-
-        // Object 7: CJK Type0 font
-        offsets[7] = pdf.items.len;
-        try pdf.appendSlice("7 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /Identity-H /DescendantFonts [8 0 R] /ToUnicode 9 0 R >>\nendobj\n\n");
-
-        // Object 8: CIDFont descendant
-        offsets[8] = pdf.items.len;
-        try pdf.appendSlice("8 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 5 >> /DW 1000 >>\nendobj\n\n");
-
-        // Object 9: ToUnicode CMap
-        offsets[9] = pdf.items.len;
-        const tounicode =
-            "/CIDInit /ProcSet findresource begin\n" ++
-            "12 dict begin\n" ++
-            "begincmap\n" ++
-            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n" ++
-            "/CMapName /Adobe-Identity-UCS def\n" ++
-            "/CMapType 2 def\n" ++
-            "1 begincodespacerange\n" ++
-            "<0000> <FFFF>\n" ++
-            "endcodespacerange\n" ++
-            "1 beginbfrange\n" ++
-            "<0000> <FFFF> <0000>\n" ++
-            "endbfrange\n" ++
-            "endcmap\n" ++
-            "CMapName currentdict /CMap defineresource pop\n" ++
-            "end\nend\n";
-        try pdf.writer().print("9 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n\n", .{ tounicode.len, tounicode });
-
-        // Dynamic objects (pages + content streams)
-        for (self.objects.items, 0..) |obj, i| {
-            const obj_id = FIXED_OBJ_COUNT + i + 1;
-            offsets[obj_id] = pdf.items.len;
-            try pdf.writer().print("{d} 0 obj\n{s}\nendobj\n\n", .{ obj_id, obj.data });
-        }
-
-        // xref table
-        const xref_pos = pdf.items.len;
-        try pdf.writer().print("xref\n0 {d}\n0000000000 65535 f \n", .{total_objects + 1});
-        for (1..total_objects + 1) |oid| {
-            try pdf.writer().print("{d:0>10} 00000 n \n", .{offsets[oid]});
-        }
-
-        try pdf.appendSlice("trailer\n");
-        try pdf.writer().print("<< /Size {d} /Root 1 0 R >>\n", .{total_objects + 1});
-        try pdf.appendSlice("startxref\n");
-        try pdf.writer().print("{d}\n%%EOF\n", .{xref_pos});
-
-        try writer.writeAll(pdf.items);
-    }
+    w: f64,
+    h: f64,
+    target: []const u8,
 };
 
-fn resolveExpr(
-    resolver: ?*const Resolver,
-    expr: []const u8,
-) []const u8 {
-    if (resolver) |r| {
-        const val = r.evalExpr(expr) catch return expr;
-        return val orelse expr;
-    }
-    return expr;
-}
+const PageRecord = struct {
+    id: usize,
+    content_id: usize,
+    links: []PageLink,
+    images: []usize,
+    resources: []const u8,
+    width: f64,
+    height: f64,
+    annots: []const u8 = "",
+};
 
-fn spanToText(
-    allocator: std.mem.Allocator,
-    span: ast.Span,
-    resolver: ?*const Resolver,
-) ![]const u8 {
-    return switch (span) {
-        .text, .bold, .italic, .code, .inline_math => |s| try allocator.dupe(u8, s),
-        .link => |l| try allocator.dupe(u8, l.text),
-        .expr => |e| try allocator.dupe(u8, resolveExpr(resolver, e)),
-        .ref_id, .footnote => |s| try allocator.dupe(u8, s),
-    };
-}
+const OutlineEntry = struct {
+    level: u8,
+    title: []const u8,
+    page_id: usize,
+    parent_index: usize,
+    children: usize,
+    id: usize,
+};
+
+const Pdf = struct {
+    allocator: Allocator,
+    io: std.Io,
+    st: style.Style,
+    objects: std.array_list.Managed(?[]const u8),
+    heading_pages: *const std.StringHashMap(usize),
+
+    fn newObject(self: *Pdf) usize {
+        self.objects.append(null) catch {};
+        return self.objects.items.len;
+    }
+
+    fn setObject(self: *Pdf, id: usize, body: []const u8) void {
+        self.objects.items[id - 1] = body;
+    }
+
+    fn fontId(font: fonts.Font) usize {
+        return FONT_BASE + @intFromEnum(font);
+    }
+
+    fn descId(font: fonts.Font) usize {
+        if (font == .cjk) return CJK_DESC_ID;
+        return DESC_BASE + @intFromEnum(font);
+    }
+};
 
 pub fn render(
-    allocator: std.mem.Allocator,
-    doc: *const ast.Document,
-    resolver: ?*const Resolver,
+    allocator: Allocator,
+    io: std.Io,
+    pages: []engine.Page,
+    st: style.Style,
+    title: []const u8,
+    author: []const u8,
+    heading_pages: *const std.StringHashMap(usize),
     writer: anytype,
 ) !void {
-    const pg = layout_mod.PageLayout.fromDoc(doc);
-    var b = PdfBuilder.init(allocator, pg);
-    defer b.deinit();
+    var pdf = Pdf{
+        .allocator = allocator,
+        .io = io,
+        .st = st,
+        .objects = std.array_list.Managed(?[]const u8).init(allocator),
+        .heading_pages = heading_pages,
+    };
 
-    try b.startPage();
+    // 预分配固定对象：1 Catalog、2 Pages、3 Outlines、4 Info、5-14 字体、15-25 描述符/CIDFont
+    for (0..25) |_| _ = pdf.newObject();
+    try buildFonts(&pdf);
 
-    // Title page section if title exists
-    if (doc.metadata) |*meta| {
-        if (meta.get("title")) |title| {
-            b.y -= 20;
-            try b.checkPageBreak(60);
-            try b.current_content.appendSlice("BT\n");
-            try b.setFont(FONT_HELVETICA_BOLD, 24);
-            const tw = cjk.measureTextWidth(title, 24);
-            try b.moveTo(b.pg.margin_left + (b.contentWidth() - tw) / 2, b.y);
-            try b.writeLineSegments(title, 24, true);
-            try b.current_content.appendSlice("ET\n");
-            b.y -= 30;
+    const records = try buildPages(&pdf, pages);
+    var page_ids = std.array_list.Managed(usize).init(allocator);
+    for (records) |r| try page_ids.append(@as(usize, r.id));
+    try buildAnnotations(&pdf, records);
+    const outline = try buildOutline(&pdf, pages, records);
 
-            if (meta.get("author")) |author| {
-                try b.current_content.appendSlice("BT\n");
-                try b.setFont(FONT_HELVETICA, 12);
-                const aw = cjk.measureTextWidth(author, 12);
-                try b.moveTo(b.pg.margin_left + (b.contentWidth() - aw) / 2, b.y);
-                try b.writeLineSegments(author, 12, false);
-                try b.current_content.appendSlice("ET\n");
-                b.y -= 18;
+    for (records) |r| {
+        pdf.setObject(r.id, try std.fmt.allocPrint(allocator, "<< /Type /Page /Parent {d} 0 R /MediaBox [0 0 {d:.2} {d:.2}] /Resources <<{s}>>{s} /Contents {d} 0 R >>", .{
+            PAGES_ID,
+            r.width,
+            r.height,
+            r.resources,
+            r.annots,
+            r.content_id,
+        }));
+    }
+
+    const kids = try joinIds(allocator, page_ids.items);
+    pdf.setObject(PAGES_ID, try std.fmt.allocPrint(allocator, "<< /Type /Pages /Count {d} /Kids [{s}] >>", .{ records.len, kids }));
+
+    // 前置内容与正文使用不同页码样式时，写 /PageLabels，阅读器才能正确显示页码
+    var labels_part: []const u8 = "";
+    if (st.front_matter_depth > 0 and pages.len > 0) {
+        const labels_id = pdf.newObject();
+        pdf.setObject(labels_id, try std.fmt.allocPrint(allocator, "<< /Num [{s}] >>", .{try pageLabels(allocator, pages, st)}));
+        labels_part = try std.fmt.allocPrint(allocator, " /PageLabels {d} 0 R", .{labels_id});
+    }
+
+    if (outline.len > 0) {
+        var first: usize = 0;
+        var last: usize = 0;
+        for (outline) |e| {
+            if (e.parent_index == 0) {
+                if (first == 0) first = e.id;
+                last = e.id;
             }
-            if (meta.get("date")) |date| {
-                try b.current_content.appendSlice("BT\n");
-                try b.setFont(FONT_HELVETICA, 10);
-                const dw = cjk.measureTextWidth(date, 10);
-                try b.moveTo(b.pg.margin_left + (b.contentWidth() - dw) / 2, b.y);
-                try b.writeLineSegments(date, 10, false);
-                try b.current_content.appendSlice("ET\n");
-                b.y -= 14;
-            }
-
-            try b.drawHRule();
-            b.y -= 10;
         }
+        pdf.setObject(OUTLINE_ID, try std.fmt.allocPrint(allocator, "<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count {d} >>", .{ first, last, outline.len }));
+    } else {
+        pdf.setObject(OUTLINE_ID, "<< /Type /Outlines /Count 0 >>");
     }
 
-    for (doc.content.items) |node| {
-        try renderNode(allocator, &b, node, resolver);
-    }
+    var outlines_part: []const u8 = "";
+    if (outline.len > 0) outlines_part = try std.fmt.allocPrint(allocator, " /Outlines {d} 0 R", .{OUTLINE_ID});
+    pdf.setObject(CATALOG_ID, try std.fmt.allocPrint(allocator, "<< /Type /Catalog /Pages {d} 0 R{s}{s} /Info {d} 0 R >>", .{
+        PAGES_ID,
+        outlines_part,
+        labels_part,
+        INFO_ID,
+    }));
 
-    try b.finalize(writer);
+    pdf.setObject(INFO_ID, try std.fmt.allocPrint(allocator, "<< /Title ({s}) /Author ({s}) /Creator (Ztype) >>", .{
+        escapeLiteral(pdf.allocator, title),
+        escapeLiteral(pdf.allocator, author),
+    }));
+
+    try serialize(&pdf, writer);
 }
 
-fn renderNode(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    node: ast.Node,
-    resolver: ?*const Resolver,
-) anyerror!void {
-    switch (node) {
-        .heading => |h| try renderHeading(allocator, b, h),
-        .paragraph => |p| try renderParagraph(allocator, b, p, resolver),
-        .script_block => {},
-        .semantic_block => |sb| try renderSemanticBlock(allocator, b, sb, resolver),
-        .list => |l| try renderList(allocator, b, l, resolver),
-        .table => |t| try renderTable(allocator, b, t),
-        .page_directive => |pd| {
-            if (std.mem.eql(u8, pd.kind, "pagebreak")) {
-                try b.endPage();
-                try b.startPage();
+// ---------------------------------------------------------------- 字体
+
+fn buildFonts(pdf: *Pdf) !void {
+    for (0..10) |i| {
+        const info = font_infos[i];
+        const font: fonts.Font = @enumFromInt(i);
+        const font_id = FONT_BASE + i;
+        const desc_id = Pdf.descId(font);
+
+        if (font == .cjk) {
+            pdf.setObject(font_id, try std.fmt.allocPrint(pdf.allocator, "<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [{d} 0 R] >>", .{CIDFONT_ID}));
+        } else {
+            const enc = if (font == .symbol) "" else " /Encoding /WinAnsiEncoding";
+            const widths = try widthsString(pdf.allocator, font);
+            pdf.setObject(font_id, try std.fmt.allocPrint(pdf.allocator, "<< /Type /Font /Subtype /Type1 /BaseFont /{s}{s} /FirstChar 32 /LastChar 255 /Widths {s} /FontDescriptor {d} 0 R >>", .{
+                info.base_font,
+                enc,
+                widths,
+                desc_id,
+            }));
+        }
+
+        pdf.setObject(desc_id, try std.fmt.allocPrint(pdf.allocator, "<< /Type /FontDescriptor /FontName /{s} /Flags {d} /FontBBox [{d} {d} {d} {d}] /ItalicAngle {d} /Ascent {d} /Descent {d} /CapHeight {d} /StemV {d} >>", .{
+            info.base_font,
+            info.flags,
+            info.bbox[0],
+            info.bbox[1],
+            info.bbox[2],
+            info.bbox[3],
+            info.italic,
+            info.ascent,
+            info.descent,
+            info.ascent * 0.72,
+            info.stem_v,
+        }));
+    }
+
+    pdf.setObject(CIDFONT_ID, "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /FontDescriptor 24 0 R /DW 1000 /W [ 1 95 500 ] >>");
+}
+
+fn widthsString(allocator: Allocator, font: fonts.Font) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    try out.append('[');
+    for (32..256) |code| {
+        var width: f64 = 500;
+        if (font == .symbol) {
+            for (metrics.SymbolGlyphs) |g| {
+                if (g.code == code) {
+                    width = g.width;
+                    break;
+                }
             }
-        },
-        .comment => {},
+        } else {
+            const table = switch (font) {
+                .helvetica => metrics.HelveticaWidths,
+                .helvetica_bold => metrics.HelveticaBoldWidths,
+                .helvetica_oblique => metrics.HelveticaObliqueWidths,
+                .times => metrics.TimesWidths,
+                .times_bold => metrics.TimesBoldWidths,
+                .times_italic => metrics.TimesItalicWidths,
+                .courier => metrics.CourierWidths,
+                .courier_bold => metrics.CourierWidths,
+                else => metrics.HelveticaWidths,
+            };
+            width = table[code];
+        }
+        try out.append(' ');
+        try appendPrint(&out, "{d}", .{width});
     }
+    try out.append(']');
+    return out.toOwnedSlice();
 }
 
-fn renderHeading(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    h: ast.Heading,
-) !void {
-    const font_size: f64 = switch (h.level) {
-        1 => 22,
-        2 => 18,
-        3 => 15,
-        else => 13,
-    };
-    const spacing_before: f64 = switch (h.level) {
-        1 => 24,
-        2 => 20,
-        3 => 16,
-        else => 12,
-    };
-    const spacing_after: f64 = switch (h.level) {
-        1 => 14,
-        2 => 10,
-        else => 8,
-    };
+// ---------------------------------------------------------------- 页面
 
-    try b.checkPageBreak(font_size + spacing_before + spacing_after);
-    b.y -= spacing_before;
+fn buildPages(pdf: *Pdf, pages: []engine.Page) ![]PageRecord {
+    var records = std.array_list.Managed(PageRecord).init(pdf.allocator);
+    const font_dict = try fontResources(pdf.allocator);
 
-    const lines = try b.wrapText(h.text, font_size);
-    defer {
-        for (lines) |line| allocator.free(line);
-        allocator.free(lines);
-    }
+    for (pages) |page| {
+        const page_id = pdf.newObject();
+        const content_id = pdf.newObject();
 
-    for (lines) |line| {
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA_BOLD, font_size);
-        try b.moveTo(b.pg.margin_left, b.y);
-        try b.writeLineSegments(line, font_size, true);
-        try b.current_content.appendSlice("ET\n");
-        b.y -= font_size * 1.3;
-    }
+        var links = std.array_list.Managed(PageLink).init(pdf.allocator);
+        var images = std.array_list.Managed(usize).init(pdf.allocator);
+        const content = try buildContent(pdf, page, &links, &images);
+        pdf.setObject(content_id, try std.fmt.allocPrint(pdf.allocator, "<< /Length {d} >>\nstream\n{s}endstream", .{ content.len, content }));
 
-    // Underline for level 1/2 headings
-    if (h.level <= 2) {
-        try b.current_content.writer().print("{d:.1} G\n{d:.1} {d:.1} m {d:.1} {d:.1} l S\n0 G\n", .{
-            if (h.level == 1) @as(f64, 0.3) else @as(f64, 0.7),
-            b.pg.margin_left,
-            b.y + 4,
-            b.pg.paper_w - b.pg.margin_right,
-            b.y + 4,
+        var resources = std.array_list.Managed(u8).init(pdf.allocator);
+        try resources.appendSlice("/Font ");
+        try resources.appendSlice(font_dict);
+        try resources.appendSlice(" /ProcSet [/PDF /Text /ImageC]");
+        if (images.items.len > 0) {
+            try resources.appendSlice(" /XObject <<");
+            for (images.items) |img_id| {
+                try appendPrint(&resources, " /X{d} {d} 0 R", .{ img_id, img_id });
+            }
+            try resources.appendSlice(" >>");
+        }
+
+        try records.append(PageRecord{
+            .id = page_id,
+            .content_id = content_id,
+            .links = try links.toOwnedSlice(),
+            .images = try images.toOwnedSlice(),
+            .resources = try resources.toOwnedSlice(),
+            .width = page.width,
+            .height = page.height,
         });
     }
 
-    b.y -= spacing_after;
+    return records.toOwnedSlice();
 }
 
-fn renderParagraph(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    p: ast.Paragraph,
-    resolver: ?*const Resolver,
-) !void {
-    var full_text = std.array_list.Managed(u8).init(allocator);
-    defer full_text.deinit();
-
-    const font_size: f64 = 11;
-    const line_height: f64 = font_size * 1.6;
-
-    // Collect all span text for line wrapping
-    for (p.spans.items) |span| {
-        const text = try spanToText(allocator, span, resolver);
-        defer allocator.free(text);
-        try full_text.appendSlice(text);
+fn fontResources(allocator: Allocator) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    try out.appendSlice("<<");
+    for (0..10) |i| {
+        try appendPrint(&out, " /F{d} {d} 0 R", .{ i + 1, FONT_BASE + i });
     }
-
-    if (full_text.items.len == 0) return;
-
-    const lines = try b.wrapText(full_text.items, font_size);
-    defer {
-        for (lines) |line| allocator.free(line);
-        allocator.free(lines);
-    }
-
-    try b.checkPageBreak(line_height * 2);
-    b.y -= 4;
-
-    for (lines) |line| {
-        try b.checkPageBreak(line_height);
-        try b.current_content.appendSlice("BT\n");
-        try b.moveTo(b.pg.margin_left, b.y);
-        try b.writeLineSegments(line, font_size, false);
-        try b.current_content.appendSlice("ET\n");
-        b.y -= line_height;
-    }
-
-    b.y -= 6;
+    try out.appendSlice(" >>");
+    return out.toOwnedSlice();
 }
 
-fn renderSemanticBlock(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    sb: ast.SemanticBlock,
-    resolver: ?*const Resolver,
-) !void {
-    if (std.mem.eql(u8, sb.block_type, "code")) {
-        try renderCodeBlock(allocator, b, sb);
-    } else if (std.mem.eql(u8, sb.block_type, "math")) {
-        try renderMathBlock(allocator, b, sb);
-    } else if (std.mem.eql(u8, sb.block_type, "quote")) {
-        try renderQuoteBlock(allocator, b, sb);
-    } else if (std.mem.eql(u8, sb.block_type, "note") or
-        std.mem.eql(u8, sb.block_type, "warning") or
-        std.mem.eql(u8, sb.block_type, "tip"))
-    {
-        try renderAdmonitionBlock(allocator, b, sb);
-    } else if (std.mem.eql(u8, sb.block_type, "figure")) {
-        try renderFigure(allocator, b, sb);
+fn buildContent(pdf: *Pdf, page: engine.Page, links: *std.array_list.Managed(PageLink), images: *std.array_list.Managed(usize)) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(pdf.allocator);
+    try buf.appendSlice("q\n");
+
+    for (page.backgrounds.items) |r| try drawRect(&buf, r);
+    for (page.items.items) |item| try drawItem(pdf, &buf, item, links, images);
+    for (page.header.items) |item| try drawItem(pdf, &buf, item, links, images);
+    for (page.footer.items) |item| try drawItem(pdf, &buf, item, links, images);
+
+    try buf.appendSlice("Q\n");
+    return buf.toOwnedSlice();
+}
+
+fn drawItem(pdf: *Pdf, buf: *std.array_list.Managed(u8), item: engine.Item, links: *std.array_list.Managed(PageLink), images: *std.array_list.Managed(usize)) !void {
+    switch (item) {
+        .text => |t| try drawText(pdf, buf, t, links),
+        .rule => |r| try drawRule(buf, r),
+        .rect => |r| try drawRect(buf, r),
+        .image => |img| try drawImage(pdf, buf, img, images),
+    }
+}
+
+fn drawText(pdf: *Pdf, buf: *std.array_list.Managed(u8), item: engine.TextItem, links: *std.array_list.Managed(PageLink)) !void {
+    if (item.text.len == 0) return;
+
+    var view = std.unicode.Utf8View.init(item.text) catch {
+        try writeRun(buf, item, item.text, item.font);
+        return;
+    };
+
+    var segment = std.array_list.Managed(u8).init(pdf.allocator);
+    var current: ?fonts.Font = null;
+    var x = item.x;
+
+    var iter = view.iterator();
+    while (iter.nextCodepoint()) |cp| {
+        const font = effectiveFont(cp, item.font);
+        if (current) |cur| {
+            if (cur != font) {
+                try writeRun(buf, item, segment.items, cur);
+                x += segmentWidth(pdf, segment.items, cur, item.size);
+                segment.clearRetainingCapacity();
+                current = font;
+            }
+        } else {
+            current = font;
+        }
+        appendCodepoint(&segment, cp, font) catch return;
+    }
+
+    if (segment.items.len > 0) {
+        try writeRun(buf, item, segment.items, current.?);
+        x += segmentWidth(pdf, segment.items, current.?, item.size);
+    }
+
+    if (item.link) |target| {
+        try links.append(PageLink{
+            .x = item.x,
+            .y = item.y - fonts.descent(item.font, item.size),
+            .w = x - item.x,
+            .h = fonts.ascent(item.font, item.size) + fonts.descent(item.font, item.size),
+            .target = target,
+        });
+    }
+}
+
+fn effectiveFont(cp: u21, base: fonts.Font) fonts.Font {
+    if (base == .cjk) return .cjk;
+    if (fonts.isCjk(cp)) return .cjk;
+    if (base == .symbol) return .symbol;
+    if (fonts.winAnsiCode(cp) != null) return base;
+    if (fonts.symbolGlyph(cp) != null) return .symbol;
+    return base;
+}
+
+fn appendCodepoint(out: *std.array_list.Managed(u8), cp: u21, font: fonts.Font) !void {
+    if (font == .cjk) {
+        var bytes: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &bytes) catch return;
+        try out.appendSlice(bytes[0..n]);
+        return;
+    }
+    if (font == .symbol) {
+        if (fonts.symbolGlyph(cp)) |g| {
+            try out.append(g.code);
+            return;
+        }
+    }
+    if (fonts.winAnsiCode(cp)) |code| {
+        try out.append(code);
+        return;
+    }
+    var bytes: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &bytes) catch return;
+    try out.appendSlice(bytes[0..n]);
+}
+
+fn segmentWidth(pdf: *Pdf, text: []const u8, font: fonts.Font, size: f64) f64 {
+    _ = pdf;
+    return fonts.measure(text, font, size);
+}
+
+fn writeRun(buf: *std.array_list.Managed(u8), item: engine.TextItem, text: []const u8, font: fonts.Font) !void {
+    try buf.appendSlice("BT\n");
+    try appendPrint(buf, "/F{d} {d:.2} Tf\n", .{ @intFromEnum(font) + 1, item.size });
+    // 字距：PDF 的 Tc（character spacing），与引擎计入自然宽度的字距一致
+    if (item.tracking != 0) try appendPrint(buf, "{d:.3} Tc\n", .{item.tracking});
+    if (font == .cjk) {
+        try appendPrint(buf, "{d} Tz\n", .{item.scale_x * 100.0});
     } else {
-        if (sb.content) |c| {
-            const trimmed = std.mem.trim(u8, c, " \n\r\t");
-            if (trimmed.len > 0) {
-                const lines = try b.wrapText(trimmed, 11);
-                defer {
-                    for (lines) |line| allocator.free(line);
-                    allocator.free(lines);
-                }
-                for (lines) |line| {
-                    try b.checkPageBreak(17);
-                    try b.current_content.appendSlice("BT\n");
-                    try b.setFont(FONT_HELVETICA, 11);
-                    try b.moveTo(b.pg.margin_left, b.y);
-                    try b.writeLineSegments(line, 11, false);
-                    try b.current_content.appendSlice("ET\n");
-                    b.y -= 17;
-                }
-                b.y -= 6;
+        try appendPrint(buf, "{d:.3} 0 0 {d:.3} 0 0 Tm\n", .{ item.scale_x, item.scale_y });
+    }
+    try appendPrint(buf, "{d:.2} {d:.2} Td\n", .{ item.x, item.y });
+    try writeColor(buf, item.color, false);
+    if (font == .cjk) {
+        try buf.appendSlice("<");
+        var view = std.unicode.Utf8View.init(text) catch {
+            try buf.appendSlice("> Tj\nET\n");
+            return;
+        };
+        var iter = view.iterator();
+        while (iter.nextCodepoint()) |cp| {
+            try appendPrint(buf, "{X:04}", .{cp});
+        }
+        try buf.appendSlice("> Tj\nET\n");
+        return;
+    }
+
+    // TJ 数组：把 kerning 直接写进文本流（等价于 TeX 的 kern 表）。
+    // text 已经是字体编码后的字节串，按字节查字距表即可。
+    try buf.append('[');
+    var prev: ?u8 = null;
+    var first = true;
+    for (text) |c| {
+        if (prev) |p| {
+            const k = fonts.kernUnits(p, c, font);
+            if (k != 0) try appendPrint(buf, " {d}", .{k});
+        }
+        if (first) {
+            first = false;
+        } else {
+            try buf.append(' ');
+        }
+        try escapeLiteralTo(buf, &[1]u8{c});
+        prev = c;
+    }
+    try buf.appendSlice("] TJ\nET\n");
+}
+
+fn drawRule(buf: *std.array_list.Managed(u8), r: engine.RuleItem) !void {
+    try buf.appendSlice("q\n");
+    try writeColor(buf, r.color, true);
+    try appendPrint(buf, "{d:.2} w\n", .{r.thickness});
+    try appendPrint(buf, "{d:.2} {d:.2} m {d:.2} {d:.2} l S\n", .{ r.x, r.y, r.x + r.w, r.y });
+    try buf.appendSlice("Q\n");
+}
+
+fn drawRect(buf: *std.array_list.Managed(u8), r: engine.RectItem) !void {
+    try buf.appendSlice("q\n");
+    if (r.fill) |c| {
+        try writeColor(buf, c, false);
+        try appendPrint(buf, "{d:.2} {d:.2} {d:.2} {d:.2} re f\n", .{ r.x, r.y, r.w, r.h });
+    } else if (r.stroke) |c| {
+        try writeColor(buf, c, true);
+        try appendPrint(buf, "{d:.2} w\n", .{0.5});
+        try appendPrint(buf, "{d:.2} {d:.2} {d:.2} {d:.2} re S\n", .{ r.x, r.y, r.w, r.h });
+    }
+    try buf.appendSlice("Q\n");
+}
+
+fn drawImage(pdf: *Pdf, buf: *std.array_list.Managed(u8), img: engine.ImageItem, images: *std.array_list.Managed(usize)) !void {
+    const id = embedJpeg(pdf, img.src);
+    if (id == 0) return;
+    try images.append(id);
+    try buf.appendSlice("q\n");
+    try appendPrint(buf, "{d:.2} 0 0 {d:.2} {d:.2} {d:.2} cm\n", .{ img.w, img.h, img.x, img.y });
+    try appendPrint(buf, "/X{d} Do\n", .{id});
+    try buf.appendSlice("Q\n");
+}
+
+fn embedJpeg(pdf: *Pdf, src: []const u8) usize {
+    const data = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), pdf.io, src, pdf.allocator, .limited(16 * 1024 * 1024)) catch return 0;
+    if (data.len < 4 or data[0] != 0xFF or data[1] != 0xD8) return 0;
+
+    var width: u16 = 0;
+    var height: u16 = 0;
+    var i: usize = 2;
+    while (i + 9 < data.len) {
+        if (data[i] != 0xFF) {
+            i += 1;
+            continue;
+        }
+        const marker = data[i + 1];
+        const is_sof = (marker >= 0xC0 and marker <= 0xCF and marker != 0xC4 and marker != 0xC8);
+        if (is_sof) {
+            width = (@as(u16, data[i + 5]) << 8) | data[i + 6];
+            height = (@as(u16, data[i + 7]) << 8) | data[i + 8];
+            break;
+        }
+        const seg_len = (@as(u16, data[i + 2]) << 8) | data[i + 3];
+        i += 2 + seg_len;
+    }
+    if (width == 0 or height == 0) return 0;
+
+    const id = pdf.newObject();
+    const body = std.fmt.allocPrint(pdf.allocator, "<< /Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {d} >>\nstream\n", .{ width, height, data.len }) catch return id;
+    pdf.setObject(id, std.fmt.allocPrint(pdf.allocator, "{s}{s}", .{ body, data }) catch body);
+    return id;
+}
+
+fn writeColor(buf: *std.array_list.Managed(u8), c: engine.Color, stroke: bool) !void {
+    try appendPrint(buf, "{d:.3} {d:.3} {d:.3} {s}\n", .{ c.r, c.g, c.b, if (stroke) "RG" else "rg" });
+}
+
+fn escapeLiteralTo(buf: *std.array_list.Managed(u8), text: []const u8) !void {
+    try buf.append('(');
+    for (text) |c| {
+        switch (c) {
+            '(' => try buf.appendSlice("\\("),
+            ')' => try buf.appendSlice("\\)"),
+            '\\' => try buf.appendSlice("\\\\"),
+            '\r' => {},
+            else => try buf.append(c),
+        }
+    }
+    try buf.append(')');
+}
+
+fn escapeLiteral(allocator: Allocator, text: []const u8) []const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    for (text) |c| {
+        switch (c) {
+            '(' => out.appendSlice("\\(") catch {},
+            ')' => out.appendSlice("\\)") catch {},
+            '\\' => out.appendSlice("\\\\") catch {},
+            else => out.append(c) catch {},
+        }
+    }
+    return out.items;
+}
+
+fn linkAction(pdf: *Pdf, target: []const u8, page_id: usize, page_ids: []const usize) ![]const u8 {
+    if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://") or std.mem.startsWith(u8, target, "mailto:")) {
+        return std.fmt.allocPrint(pdf.allocator, "/A << /S /URI /URI ({s}) >>", .{escapeLiteral(pdf.allocator, target)});
+    }
+    if (pdf.heading_pages.get(target)) |page_number| {
+        if (page_number >= 1 and page_number <= page_ids.len) {
+            return std.fmt.allocPrint(pdf.allocator, "/Dest [{d} 0 R /XYZ null null null]", .{page_ids[page_number - 1]});
+        }
+    }
+    _ = page_id;
+    return "";
+}
+
+fn buildAnnotations(pdf: *Pdf, records: []PageRecord) !void {
+    var page_ids = std.array_list.Managed(usize).init(pdf.allocator);
+    for (records) |r| try page_ids.append(@as(usize, r.id));
+
+    for (records, 0..) |r, i| {
+        if (r.links.len == 0) continue;
+        var ids = std.array_list.Managed(usize).init(pdf.allocator);
+        for (r.links) |_| try ids.append(pdf.newObject());
+        for (r.links, 0..) |l, j| {
+            const rect = try std.fmt.allocPrint(pdf.allocator, "[{d:.2} {d:.2} {d:.2} {d:.2}]", .{ l.x, l.y, l.x + l.w, l.y + l.h });
+            const action = try linkAction(pdf, l.target, r.id, page_ids.items);
+            pdf.setObject(ids.items[j], try std.fmt.allocPrint(pdf.allocator, "<< /Type /Annot /Subtype /Link /Rect {s} /Border [0 0 0] /Parent {d} 0 R{s} >>", .{ rect, r.id, action }));
+        }
+        const joined = try joinIds(pdf.allocator, ids.items);
+        records[i].annots = try std.fmt.allocPrint(pdf.allocator, " /Annots [{s}]", .{joined});
+    }
+}
+
+// ---------------------------------------------------------------- 大纲
+
+fn buildOutline(pdf: *Pdf, pages: []engine.Page, records: []PageRecord) ![]OutlineEntry {
+    var entries = std.array_list.Managed(OutlineEntry).init(pdf.allocator);
+    for (pages) |page| {
+        for (page.bookmarks.items) |b| {
+            try entries.append(OutlineEntry{
+                .level = b.level,
+                .title = b.title,
+                .page_id = records[page.number - 1].id,
+                .parent_index = 0,
+                .children = 0,
+                .id = 0,
+            });
+        }
+    }
+
+    var stack = std.array_list.Managed(usize).init(pdf.allocator);
+    for (entries.items, 0..) |*e, i| {
+        while (stack.items.len > 0) {
+            const parent = entries.items[stack.items[stack.items.len - 1]];
+            if (parent.level < e.level) break;
+            _ = stack.pop();
+        }
+        if (stack.items.len > 0) e.parent_index = stack.items[stack.items.len - 1];
+        if (e.parent_index != 0) entries.items[e.parent_index].children += 1;
+        try stack.append(i);
+    }
+
+    for (entries.items) |*e| e.id = pdf.newObject();
+
+    for (entries.items, 0..) |e, i| {
+        var prev: usize = 0;
+        var next: usize = 0;
+        for (entries.items, 0..) |sibling, j| {
+            if (sibling.parent_index != e.parent_index) continue;
+            if (j < i) prev = sibling.id;
+            if (j > i) {
+                next = sibling.id;
+                break;
             }
         }
-        for (sb.children.items) |child| {
-            try renderNode(allocator, b, child, resolver);
+        const parent_id = if (e.parent_index == 0) OUTLINE_ID else entries.items[e.parent_index].id;
+        const prev_str = if (prev != 0) try std.fmt.allocPrint(pdf.allocator, " /Prev {d} 0 R", .{prev}) else "";
+        const next_str = if (next != 0) try std.fmt.allocPrint(pdf.allocator, " /Next {d} 0 R", .{next}) else "";
+        pdf.setObject(e.id, try std.fmt.allocPrint(pdf.allocator, "<< /Type /Outlines /Title ({s}) /Parent {d} 0 R /Dest [{d} 0 R /XYZ null null null] /Count {d}{s}{s} >>", .{
+            escapeLiteral(pdf.allocator, e.title),
+            parent_id,
+            e.page_id,
+            e.children,
+            prev_str,
+            next_str,
+        }));
+    }
+
+    return entries.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------- 输出
+
+fn joinIds(allocator: Allocator, ids: []usize) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    for (ids, 0..) |id, i| {
+        if (i > 0) try out.append(' ');
+        try appendPrint(&out, "{d} 0 R", .{id});
+    }
+    return out.toOwnedSlice();
+}
+
+/// PDF 页码样式名：/D 十进制、/R 罗马、/r 小写罗马、/A 字母
+fn numberStyleName(s: style.NumberStyle) []const u8 {
+    return switch (s) {
+        .arabic => "/D",
+        .roman => "/R",
+        .roman_lower => "/r",
+        .letters => "/A",
+    };
+}
+
+/// 按页码样式把页分组，生成 /Num 数组：`0 << /S /r >> 3 << /S /D >>`
+fn pageLabels(allocator: Allocator, pages: []engine.Page, st: style.Style) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    var i: usize = 0;
+    while (i < pages.len) {
+        const s = if (st.front_matter_depth > 0 and pages[i].number <= st.front_matter_depth) st.front_number_style else st.page_number_style;
+        var j = i + 1;
+        while (j < pages.len) {
+            const js = if (st.front_matter_depth > 0 and pages[j].number <= st.front_matter_depth) st.front_number_style else st.page_number_style;
+            if (js != s) break;
+            j += 1;
         }
+        if (out.items.len > 0) try out.append(' ');
+        try appendPrint(&out, "{d} << /S {s} >>", .{ i, numberStyleName(s) });
+        i = j;
     }
+    return try out.toOwnedSlice();
 }
 
-fn renderCodeBlock(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    sb: ast.SemanticBlock,
-) !void {
-    const content = sb.content orelse return;
-    const trimmed = std.mem.trim(u8, content, " \n\r\t");
-    if (trimmed.len == 0) return;
+fn serialize(pdf: *Pdf, writer: anytype) !void {
+    var out = std.array_list.Managed(u8).init(pdf.allocator);
+    var offsets = std.array_list.Managed(usize).init(pdf.allocator);
 
-    const code_font_size: f64 = 9;
-    const code_line_height: f64 = code_font_size * 1.5;
-    const padding: f64 = 8;
-    const indent: f64 = 12;
-
-    var code_lines = std.array_list.Managed([]const u8).init(allocator);
-    defer {
-        for (code_lines.items) |_| {}
-        code_lines.deinit();
+    try out.appendSlice("%PDF-1.7\n");
+    for (pdf.objects.items, 1..) |body, id| {
+        try offsets.append(out.items.len);
+        try appendPrint(&out, "{d} 0 obj\n", .{id});
+        if (body) |b| try out.appendSlice(b) else try out.appendSlice("null");
+        try out.appendSlice("\nendobj\n");
     }
 
-    var line_iter = std.mem.splitScalar(u8, trimmed, '\n');
-    while (line_iter.next()) |line| {
-        try code_lines.append(line);
+    const xref_offset = out.items.len;
+    try appendPrint(&out, "xref\n0 {d}\n", .{pdf.objects.items.len + 1});
+    try out.appendSlice("0000000000 00000 f \n");
+    for (offsets.items) |off| {
+        try appendPrint(&out, "{d:0>10} 00000 n \n", .{off});
     }
-
-    const block_height = @as(f64, @floatFromInt(code_lines.items.len)) * code_line_height + padding * 2;
-    try b.checkPageBreak(block_height + 20);
-    b.y -= 8;
-
-    // Background rectangle
-    try b.drawRect(
-        b.pg.margin_left,
-        b.y - block_height + padding,
-        b.contentWidth(),
-        block_height,
-        0.95,
-        0.95,
-        0.95,
-    );
-
-    // Caption (if any)
-    if (sb.attrs.get("caption")) |caption| {
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA_OBLIQUE, 9);
-        try b.moveTo(b.pg.margin_left + indent, b.y + 2);
-        try b.writeLineSegments(caption, 9, false);
-        try b.current_content.appendSlice("ET\n");
-    }
-
-    b.y -= padding;
-
-    for (code_lines.items) |line| {
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_COURIER, code_font_size);
-        try b.moveTo(b.pg.margin_left + indent, b.y);
-        if (line.len > 0) {
-            try b.showText(line);
-        }
-        try b.current_content.appendSlice("ET\n");
-        b.y -= code_line_height;
-    }
-
-    b.y -= padding + 8;
-}
-
-fn renderMathBlock(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    sb: ast.SemanticBlock,
-) !void {
-    const content = sb.content orelse return;
-    const trimmed = std.mem.trim(u8, content, " \n\r\t");
-    if (trimmed.len == 0) return;
-
-    try b.checkPageBreak(30);
-    b.y -= 10;
-
-    // Centered, italic, with light background
-    const tw = cjk.measureTextWidth(trimmed, 11);
-    const cx = b.pg.margin_left + (b.contentWidth() - tw) / 2;
-
-    try b.drawRect(
-        b.pg.margin_left + 20,
-        b.y - 6,
-        b.contentWidth() - 40,
-        22,
-        0.97,
-        0.97,
-        1.0,
-    );
-
-    try b.current_content.appendSlice("BT\n");
-    try b.setFont(FONT_HELVETICA_OBLIQUE, 11);
-    try b.moveTo(cx, b.y);
-    try b.writeLineSegments(trimmed, 11, false);
-    try b.current_content.appendSlice("ET\n");
-    b.y -= 24;
-
-    _ = allocator;
-}
-
-fn renderQuoteBlock(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    sb: ast.SemanticBlock,
-) !void {
-    const content = sb.content orelse return;
-    const trimmed = std.mem.trim(u8, content, " \n\r\t");
-    if (trimmed.len == 0) return;
-
-    const font_size: f64 = 10.5;
-    const line_height: f64 = font_size * 1.6;
-    const indent: f64 = 24;
-
-    const lines = try b.wrapText(trimmed, font_size);
-    defer {
-        for (lines) |line| allocator.free(line);
-        allocator.free(lines);
-    }
-
-    const block_height = @as(f64, @floatFromInt(lines.len)) * line_height + 16;
-    try b.checkPageBreak(block_height);
-    b.y -= 8;
-
-    // Left border bar
-    try b.current_content.writer().print("0.6 0.6 0.6 rg\n{d:.1} {d:.1} 3 {d:.1} re f\n0 0 0 rg\n", .{
-        b.pg.margin_left + 4,
-        b.y - block_height + 16,
-        block_height - 8,
+    try appendPrint(&out, "trailer\n<< /Size {d} /Root {d} 0 R /Info {d} 0 R >>\nstartxref\n{d}\n%%EOF\n", .{
+        pdf.objects.items.len + 1,
+        CATALOG_ID,
+        INFO_ID,
+        xref_offset,
     });
 
-    // Gray text color
-    try b.current_content.appendSlice("0.3 0.3 0.3 rg\n");
-    for (lines) |line| {
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA_OBLIQUE, font_size);
-        try b.moveTo(b.pg.margin_left + indent, b.y);
-        try b.writeLineSegments(line, font_size, false);
-        try b.current_content.appendSlice("ET\n");
-        b.y -= line_height;
-    }
-
-    // Attribution
-    if (sb.attrs.get("source")) |source| {
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA, 9);
-        try b.moveTo(b.pg.margin_left + indent, b.y);
-        try b.showTextAscii("— ");
-        try b.showText(source);
-        try b.current_content.appendSlice("ET\n");
-        b.y -= 14;
-    }
-
-    try b.current_content.appendSlice("0 0 0 rg\n");
-    b.y -= 10;
-}
-
-fn renderAdmonitionBlock(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    sb: ast.SemanticBlock,
-) !void {
-    const content = sb.content orelse return;
-    const trimmed = std.mem.trim(u8, content, " \n\r\t");
-    if (trimmed.len == 0) return;
-
-    const font_size: f64 = 10;
-    const line_height: f64 = font_size * 1.5;
-    const padding: f64 = 10;
-
-    const lines = try b.wrapText(trimmed, font_size);
-    defer {
-        for (lines) |line| allocator.free(line);
-        allocator.free(lines);
-    }
-
-    const block_height = @as(f64, @floatFromInt(lines.len)) * line_height + padding * 2 + 20;
-    try b.checkPageBreak(block_height);
-    b.y -= 8;
-
-    // Background color based on type
-    const bg = if (std.mem.eql(u8, sb.block_type, "warning"))
-        .{ @as(f64, 1.0), @as(f64, 0.95), @as(f64, 0.88) }
-    else if (std.mem.eql(u8, sb.block_type, "tip"))
-        .{ @as(f64, 0.91), @as(f64, 0.96), @as(f64, 0.91) }
-    else
-        .{ @as(f64, 0.91), @as(f64, 0.95), @as(f64, 0.97) };
-
-    try b.drawRect(
-        b.pg.margin_left,
-        b.y - block_height + padding * 2,
-        b.contentWidth(),
-        block_height,
-        bg[0],
-        bg[1],
-        bg[2],
-    );
-
-    // Title
-    const title = if (std.mem.eql(u8, sb.block_type, "warning"))
-        "Warning"
-    else if (std.mem.eql(u8, sb.block_type, "tip"))
-        "Tip"
-    else
-        "Note";
-
-    try b.current_content.appendSlice("BT\n");
-    try b.setFont(FONT_HELVETICA_BOLD, 10);
-    try b.moveTo(b.pg.margin_left + padding, b.y);
-    try b.showTextAscii(title);
-    try b.current_content.appendSlice("ET\n");
-    b.y -= 16;
-
-    for (lines) |line| {
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA, font_size);
-        try b.moveTo(b.pg.margin_left + padding, b.y);
-        try b.writeLineSegments(line, font_size, false);
-        try b.current_content.appendSlice("ET\n");
-        b.y -= line_height;
-    }
-
-    b.y -= padding + 6;
-}
-
-fn renderFigure(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    sb: ast.SemanticBlock,
-) !void {
-    _ = allocator;
-    const caption = sb.attrs.get("caption") orelse "";
-    if (caption.len == 0) return;
-
-    try b.checkPageBreak(30);
-    b.y -= 8;
-
-    // Render caption centered
-    const tw = cjk.measureTextWidth(caption, 10);
-    try b.current_content.appendSlice("BT\n");
-    try b.setFont(FONT_HELVETICA_OBLIQUE, 10);
-    try b.moveTo(b.pg.margin_left + (b.contentWidth() - tw) / 2, b.y);
-    try b.writeLineSegments(caption, 10, false);
-    try b.current_content.appendSlice("ET\n");
-    b.y -= 18;
-}
-
-fn renderList(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    l: ast.List,
-    resolver: ?*const Resolver,
-) !void {
-    const font_size: f64 = 11;
-    const line_height: f64 = font_size * 1.5;
-    const bullet_indent: f64 = 16;
-
-    try b.checkPageBreak(line_height * 2);
-    b.y -= 4;
-
-    for (l.items.items, 0..) |item, idx| {
-        var text = std.array_list.Managed(u8).init(allocator);
-        defer text.deinit();
-        for (item.spans.items) |span| {
-            const s = try spanToText(allocator, span, resolver);
-            defer allocator.free(s);
-            try text.appendSlice(s);
-        }
-
-        // Bullet or number prefix
-        var prefix_buf: [16]u8 = undefined;
-        const prefix = if (l.ordered)
-            std.fmt.bufPrint(&prefix_buf, "{d}. ", .{idx + 1}) catch "- "
-        else
-            "\xe2\x80\xa2 "; // Unicode bullet •
-
-        try b.checkPageBreak(line_height);
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA, font_size);
-        try b.moveTo(b.pg.margin_left + bullet_indent, b.y);
-        try b.showTextAscii(prefix);
-        try b.current_content.appendSlice("ET\n");
-
-        // Item text (wrapped, indented further)
-        const saved_margin = b.pg.margin_left;
-        b.pg.margin_left += bullet_indent + 12;
-
-        const lines = try b.wrapText(text.items, font_size);
-        defer {
-            for (lines) |line| allocator.free(line);
-            allocator.free(lines);
-        }
-
-        for (lines, 0..) |line, li| {
-            if (li > 0) {
-                try b.checkPageBreak(line_height);
-            }
-            try b.current_content.appendSlice("BT\n");
-            try b.setFont(FONT_HELVETICA, font_size);
-            try b.moveTo(b.pg.margin_left, b.y);
-            try b.writeLineSegments(line, font_size, false);
-            try b.current_content.appendSlice("ET\n");
-            b.y -= line_height;
-        }
-
-        b.pg.margin_left = saved_margin;
-    }
-
-    b.y -= 6;
-}
-
-fn renderTable(
-    allocator: std.mem.Allocator,
-    b: *PdfBuilder,
-    t: ast.Table,
-) !void {
-    const font_size: f64 = 10;
-    const row_height: f64 = 18;
-    const cell_padding: f64 = 6;
-    const num_cols = t.headers.items.len;
-    if (num_cols == 0) return;
-
-    const col_width = b.contentWidth() / @as(f64, @floatFromInt(num_cols));
-    const total_rows: usize = 1 + t.rows.items.len;
-    const total_height = @as(f64, @floatFromInt(total_rows)) * row_height;
-
-    try b.checkPageBreak(total_height + 20);
-    b.y -= 8;
-
-    const table_top = b.y;
-    const x_start = b.pg.margin_left;
-
-    // Header background
-    try b.drawRect(x_start, table_top - row_height, b.contentWidth(), row_height, 0.92, 0.92, 0.92);
-
-    // Header text
-    for (t.headers.items, 0..) |header, ci| {
-        const x = x_start + @as(f64, @floatFromInt(ci)) * col_width + cell_padding;
-        try b.current_content.appendSlice("BT\n");
-        try b.setFont(FONT_HELVETICA_BOLD, font_size);
-        try b.moveTo(x, table_top - row_height + 5);
-        try b.writeLineSegments(header, font_size, true);
-        try b.current_content.appendSlice("ET\n");
-    }
-
-    // Data rows
-    for (t.rows.items, 0..) |row, ri| {
-        const ry = table_top - @as(f64, @floatFromInt(ri + 1)) * row_height;
-
-        // Alternating row background
-        if (ri % 2 == 1) {
-            try b.drawRect(x_start, ry - row_height, b.contentWidth(), row_height, 0.97, 0.97, 0.97);
-        }
-
-        for (row.items, 0..) |cell, ci| {
-            if (ci >= num_cols) break;
-            const x = x_start + @as(f64, @floatFromInt(ci)) * col_width + cell_padding;
-            try b.current_content.appendSlice("BT\n");
-            try b.setFont(FONT_HELVETICA, font_size);
-            try b.moveTo(x, ry - row_height + 5);
-            try b.writeLineSegments(cell, font_size, false);
-            try b.current_content.appendSlice("ET\n");
-        }
-    }
-
-    // Grid lines
-    try b.current_content.appendSlice("0.7 G\n0.5 w\n");
-    // Horizontal lines
-    for (0..total_rows + 1) |ri| {
-        const ly = table_top - @as(f64, @floatFromInt(ri)) * row_height;
-        try b.current_content.writer().print("{d:.1} {d:.1} m {d:.1} {d:.1} l S\n", .{
-            x_start,    ly,
-            x_start + b.contentWidth(), ly,
-        });
-    }
-    // Vertical lines
-    for (0..num_cols + 1) |ci| {
-        const lx = x_start + @as(f64, @floatFromInt(ci)) * col_width;
-        try b.current_content.writer().print("{d:.1} {d:.1} m {d:.1} {d:.1} l S\n", .{
-            lx,                        table_top,
-            lx, table_top - total_height,
-        });
-    }
-    try b.current_content.appendSlice("0 G\n1 w\n");
-
-    b.y = table_top - total_height - 12;
-    _ = allocator;
+    try writer.writeAll(out.items);
 }
