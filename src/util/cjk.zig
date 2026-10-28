@@ -43,7 +43,7 @@ pub fn utf8ToRtf(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
                 @as(i16, @intCast(@as(i32, @intCast(codepoint)) - 65536))
             else
                 @as(i16, -3); // U+FFFD for astral plane
-            try result.writer().print("\\u{d}?", .{n});
+            try appendPrint(&result, "\\u{d}?", .{n});
         }
     }
     return result.toOwnedSlice();
@@ -93,16 +93,16 @@ pub fn utf8ToPdfHex(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
                 '\n' => try result.appendSlice("000A"),
                 '\r' => try result.appendSlice("000D"),
                 '\t' => try result.appendSlice("0009"),
-                else => try result.writer().print("{X:0>4}", .{codepoint}),
+                else => try appendPrint(&result, "{X:0>4}", .{codepoint}),
             }
         } else {
             // UTF-16BE 十六进制（BOM 已在开头输出）
             if (codepoint <= 0xFFFF) {
-                try result.writer().print("{X:0>4}", .{codepoint});
+                try appendPrint(&result, "{X:0>4}", .{codepoint});
             } else {
                 const high = 0xD800 + ((codepoint - 0x10000) >> 10);
                 const low = 0xDC00 + ((codepoint - 0x10000) & 0x3FF);
-                try result.writer().print("{X:0>4}{X:0>4}", .{ high, low });
+                try appendPrint(&result, "{X:0>4}{X:0>4}", .{ high, low });
             }
         }
     }
@@ -178,6 +178,11 @@ pub fn measureTextWidth(s: []const u8, font_size: f64) f64 {
 }
 
 /// A text segment — either Latin (rendered with Helvetica) or CJK (rendered with CIDFont)
+fn appendPrint(list: *std.array_list.Managed(u8), comptime fmt: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(list.allocator, fmt, args);
+    try list.appendSlice(s);
+}
+
 pub const TextSegment = struct {
     text: []const u8,
     is_cjk: bool,
